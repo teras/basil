@@ -1,0 +1,16 @@
+{
+  "_comment": "Add this to your ~/.claude/settings.json inside the 'hooks' object",
+  "_install": "Merge this into your existing settings.json hooks section",
+
+  "PermissionRequest": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "~/.claude/hooks/basil_permission.py"
+        }
+      ]
+    }
+  ]
+}
