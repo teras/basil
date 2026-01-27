@@ -230,7 +230,8 @@ CHAT_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Basil Chat</title>
+    <title>Basil</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌿</text></svg>">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
@@ -700,6 +701,16 @@ CHAT_HTML = """
             color: white;
         }
 
+        .scroll-btn.active {
+            background: rgba(74, 222, 128, 0.2);
+            border-color: rgba(74, 222, 128, 0.5);
+            color: #4ade80;
+        }
+
+        .scroll-btn.active:hover {
+            background: rgba(74, 222, 128, 0.3);
+        }
+
         #messageInput {
             flex: 1;
             background: rgba(255,255,255,0.1);
@@ -927,6 +938,7 @@ CHAT_HTML = """
                 const data = await resp.json();
                 const projectNameEl = document.getElementById('projectName');
                 projectNameEl.textContent = data.name;
+                document.title = data.name + ' - Basil';
                 if (data.path) {
                     projectNameEl.title = data.path;
                 }
@@ -952,14 +964,6 @@ CHAT_HTML = """
                 }
             }
         }
-
-        // Track if user scrolls up manually (ignore our own scrolls)
-        chatContainer.addEventListener('scroll', () => {
-            if (programmaticScroll) return;
-            const threshold = 150;
-            const atBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight < threshold;
-            userScrolledUp = !atBottom;
-        });
 
         // Session picker toggle
         sessionBtn.addEventListener('click', async (e) => {
@@ -1182,7 +1186,13 @@ CHAT_HTML = """
 
             const msg = document.createElement('div');
             msg.className = `message ${type}`;
-            chatContainer.appendChild(msg);
+
+            // Insert before typing indicator if it's active, otherwise append
+            if (typingIndicator.classList.contains('active')) {
+                chatContainer.insertBefore(msg, typingIndicator);
+            } else {
+                chatContainer.appendChild(msg);
+            }
             scrollToBottom();
             return msg;
         }
@@ -1378,14 +1388,47 @@ CHAT_HTML = """
         sendBtn.addEventListener('click', sendMessage);
 
         // Auto-resize textarea
+        let lastTextareaHeight = 52; // min-height
+
         function autoResize() {
+            const oldHeight = lastTextareaHeight;
             messageInput.style.height = 'auto';
-            messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
-            // Show scrollbar if at max height
+            const newHeight = Math.min(messageInput.scrollHeight, 200);
+            messageInput.style.height = newHeight + 'px';
             messageInput.style.overflowY = messageInput.scrollHeight > 200 ? 'auto' : 'hidden';
+
+            // Scroll to bottom when textarea grows (works in Chrome)
+            if (newHeight > oldHeight && !userScrolledUp) {
+                scrollToBottom();
+            }
+            lastTextareaHeight = newHeight;
         }
 
         messageInput.addEventListener('input', autoResize);
+
+        // Track user scroll and update button indicators
+        function updateScrollButtons() {
+            const scrollUpBtn = document.getElementById('scrollUpBtn');
+            const scrollDownBtn = document.getElementById('scrollDownBtn');
+            const canScrollUp = chatContainer.scrollTop > 10;
+            const canScrollDown = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight > 10;
+
+            scrollUpBtn.classList.toggle('active', canScrollUp);
+            scrollDownBtn.classList.toggle('active', canScrollDown);
+        }
+
+        chatContainer.addEventListener('scroll', () => {
+            updateScrollButtons();
+            if (programmaticScroll) return;
+            const atBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight < 150;
+            userScrolledUp = !atBottom;
+        });
+
+        // Update buttons on resize too
+        new ResizeObserver(updateScrollButtons).observe(chatContainer);
+
+        // Initial update
+        setTimeout(updateScrollButtons, 100);
 
         messageInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
