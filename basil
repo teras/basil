@@ -1,0 +1,307 @@
+#!/bin/bash
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# --- Check dependencies ---
+check_deps() {
+    local missing=()
+    for cmd in docker jq; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Missing required commands:${NC}"
+        for cmd in "${missing[@]}"; do
+            echo "  - $cmd"
+        done
+        echo ""
+        echo "Please install them and try again."
+        exit 1
+    fi
+}
+check_deps
+
+IMAGE_NAME="claude-code-runner"
+CONTAINER_PREFIX="claude"
+
+# Get the directory where basil is installed (resolve symlinks)
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ $SCRIPT_PATH != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+
+# --- Helper: Get container name from project path ---
+get_container_name() {
+    local project_dir="$1"
+    local basename=$(basename "$project_dir")
+    echo "${CONTAINER_PREFIX}-${basename}"
+}
+
+# --- Helper: Check if port is available ---
+is_port_free() {
+    local port="$1"
+    ! ss -tuln 2>/dev/null | grep -q ":${port} " && \
+    ! docker ps --format '{{.Ports}}' 2>/dev/null | grep -q "0.0.0.0:${port}->"
+}
+
+# --- Helper: Get port for project (hash-based, range 8100-8199, auto-increment if busy) ---
+get_project_port() {
+    local project_dir="$1"
+    local basename=$(basename "$project_dir")
+    # Simple hash: sum of ASCII values mod 100 + 8100
+    local hash=0
+    for (( i=0; i<${#basename}; i++ )); do
+        hash=$((hash + $(printf '%d' "'${basename:$i:1}")))
+    done
+    local base_port=$((8100 + hash % 100))
+    local port=$base_port
+    local max_tries=100
+
+    # Find first available port
+    while ! is_port_free "$port" && [ $((port - base_port)) -lt $max_tries ]; do
+        port=$((port + 1))
+        # Wrap around if needed
+        if [ $port -ge 8200 ]; then
+            port=8100
+        fi
+    done
+    echo $port
+}
+
+# --- Build ---
+build() {
+    echo -e "${GREEN}Building Docker image...${NC}"
+
+    # Create temp build context
+    local BUILD_DIR=$(mktemp -d)
+    trap "rm -rf $BUILD_DIR" EXIT
+
+    # Copy src module
+    \cp -r "$SCRIPT_DIR/src" "$BUILD_DIR/src"
+
+    # Write Dockerfile with COPY instruction
+    cat > "$BUILD_DIR/Dockerfile" << 'DOCKERFILE_END'
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_MAJOR=22
+
+# Basic tools + development essentials
+RUN apt-get update && apt-get install -y \
+    curl wget git sudo \
+    build-essential cmake pkg-config \
+    python3 python3-pip python3-venv \
+    ripgrep fd-find \
+    jq tree htop vim nano \
+    unzip zip tar \
+    openssh-client ca-certificates \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Install Basil web dependencies
+RUN pip3 install --break-system-packages fastapi uvicorn[standard] pydantic-settings
+
+# Create workspace and home directories
+RUN mkdir -p /workspace /home/claude/.claude \
+    && chmod 777 /home/claude /home/claude/.claude
+
+# Copy Basil source
+COPY src /opt/basil/src
+
+WORKDIR /workspace
+CMD ["bash"]
+DOCKERFILE_END
+
+    docker build -t "$IMAGE_NAME" "$BUILD_DIR"
+    echo -e "${GREEN}✓ Image built${NC}"
+}
+
+# --- Init (create .basil in project) ---
+init_project() {
+    local PROJECT_DIR="$1"
+    local CLAUDE_DIR="$PROJECT_DIR/.basil"
+
+    # Check source credentials exist
+    if [ ! -f "$HOME/.claude/.credentials.json" ]; then
+        echo -e "${RED}Error: ~/.claude/.credentials.json not found${NC}"
+        echo "Please login to Claude Code first: claude login"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Initializing...${NC}"
+
+    # Create .basil directory
+    rm -rf "$CLAUDE_DIR"
+
+    # Copy entire ~/.claude folder (following symlinks)
+    \cp -rL "$HOME/.claude" "$CLAUDE_DIR"
+
+    # Copy ~/.claude.json (separate file with onboarding state, theme, etc.)
+    if [ -f "$HOME/.claude.json" ]; then
+        \cp -L "$HOME/.claude.json" "$CLAUDE_DIR/.claude.json"
+    fi
+
+    # Strip hooks from settings (they reference host paths)
+    if [ -f "$CLAUDE_DIR/settings.json" ]; then
+        jq 'del(.hooks)' "$CLAUDE_DIR/settings.json" > "$CLAUDE_DIR/settings.json.tmp"
+        mv "$CLAUDE_DIR/settings.json.tmp" "$CLAUDE_DIR/settings.json"
+    fi
+    if [ -f "$CLAUDE_DIR/settings.local.json" ]; then
+        jq 'del(.hooks)' "$CLAUDE_DIR/settings.local.json" > "$CLAUDE_DIR/settings.local.json.tmp"
+        mv "$CLAUDE_DIR/settings.local.json.tmp" "$CLAUDE_DIR/settings.local.json"
+    fi
+
+    # Update .gitignore
+    local GITIGNORE="$PROJECT_DIR/.gitignore"
+    if [ -f "$GITIGNORE" ]; then
+        if ! grep -q "^\.basil/$" "$GITIGNORE" && ! grep -q "^\.basil$" "$GITIGNORE"; then
+            echo ".basil/" >> "$GITIGNORE"
+        fi
+    else
+        echo ".basil/" > "$GITIGNORE"
+    fi
+}
+
+# --- Start container + API server ---
+start() {
+    local PROJECT_DIR="$PWD"
+    local CLAUDE_DIR="$PROJECT_DIR/.basil"
+    local CONTAINER_NAME=$(get_container_name "$PROJECT_DIR")
+    local SERVE_UI=0
+    local PORT=""
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ui)
+                SERVE_UI=1
+                shift
+                ;;
+            --port)
+                PORT="$2"
+                shift 2
+                ;;
+            --port=*)
+                PORT="${1#*=}"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Default port based on project name
+    if [ -z "$PORT" ]; then
+        PORT=$(get_project_port "$PROJECT_DIR")
+    fi
+
+    # Auto-init if needed
+    if [ ! -d "$CLAUDE_DIR" ] || [ ! -f "$CLAUDE_DIR/.credentials.json" ]; then
+        init_project "$PROJECT_DIR"
+    fi
+
+    # Check if container already running
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo -e "${YELLOW}Already running${NC}"
+        echo "Use 'basil stop' first, or open http://localhost:${PORT}"
+        exit 0
+    fi
+
+    # Remove any stopped container with same name
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+    # Build mount arguments
+    local MOUNTS=(
+        -v "$PROJECT_DIR:/workspace"
+        -v "$CLAUDE_DIR:/home/claude/.claude"
+    )
+    if [ -f "$CLAUDE_DIR/.claude.json" ]; then
+        MOUNTS+=(-v "$CLAUDE_DIR/.claude.json:/home/claude/.claude.json")
+    fi
+
+    if [ "$SERVE_UI" = "1" ]; then
+        echo -e "${GREEN}Basil on http://localhost:${PORT}${NC}"
+    else
+        echo -e "${GREEN}Basil API on http://localhost:${PORT}${NC}"
+        echo "  (--ui for web interface)"
+    fi
+    echo "  Ctrl+C to stop"
+    echo ""
+
+    # Run container with server directly (foreground)
+    local PROJECT_NAME=$(basename "$PROJECT_DIR")
+    # Use -t only if we have a TTY
+    local TTY_FLAG=""
+    if [ -t 0 ]; then
+        TTY_FLAG="-t"
+    fi
+    docker run --rm -i $TTY_FLAG --name "$CONTAINER_NAME" \
+        --user "$(id -u):$(id -g)" \
+        -p ${PORT}:${PORT} \
+        -w /workspace \
+        -e HOME=/home/claude \
+        -e CI=1 \
+        -e HOST=0.0.0.0 \
+        -e PORT=${PORT} \
+        -e SERVE_UI=$SERVE_UI \
+        -e PROJECT_NAME="$PROJECT_NAME" \
+        -e PROJECT_PATH="$PROJECT_DIR" \
+        -e PYTHONPATH=/opt/basil \
+        "${MOUNTS[@]}" \
+        "$IMAGE_NAME" \
+        python3 -m src.main
+}
+
+# --- Stop ---
+stop() {
+    local CONTAINER_NAME=$(get_container_name "$PWD")
+
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        docker stop "$CONTAINER_NAME" >/dev/null 2>&1
+        echo -e "${GREEN}✓ Stopped${NC}"
+    else
+        echo "Not running"
+    fi
+}
+
+# --- Main ---
+case "${1:-help}" in
+    build)
+        build
+        ;;
+    start)
+        shift
+        start "$@"
+        ;;
+    stop)
+        stop
+        ;;
+    *)
+        echo "Basil - Claude Code in Docker"
+        echo ""
+        echo "  basil build                   Build image (once)"
+        echo "  basil start [--ui] [--port N] Start server"
+        echo "  basil stop                    Stop server"
+        echo ""
+        echo "Port is auto-assigned per project (8100-8199) unless --port specified"
+        ;;
+esac

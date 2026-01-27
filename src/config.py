@@ -15,14 +15,20 @@ class Settings(BaseSettings):
 
     # Server
     host: str = "127.0.0.1"
-    port: int = 8080
+    port: int = 8035
 
     # Claude
     default_working_dir: Path = Path.home()
-    permission_timeout: int = 120  # seconds to wait for permission response
 
-    # Sessions
-    session_dir: Path = Path.home() / ".basil" / "sessions"
+    # Sessions - stored in ~/.claude/sessions (mapped to PROJECT/.basil/sessions in Docker)
+    session_dir: Path = Path.home() / ".claude" / "sessions"
+
+    # UI
+    serve_ui: bool = False
+
+    # Project
+    project_name: str = "project"
+    project_path: str = ""  # Full path on host (for display purposes)
 
 
 # Global settings instance

@@ -24,7 +24,7 @@ class ResponseBlock:
     """A block of response from Claude."""
     block_id: int
     content: str
-    block_type: str = "text"  # "text", "code", "permission", "error"
+    block_type: str = "text"  # "text", "tool", "error", "done"
     more: bool = False
     metadata: dict = field(default_factory=dict)
 
@@ -45,16 +45,26 @@ class Session:
     working_dir: str
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     claude_session_id: str | None = None  # Claude's internal session ID for --continue
+    name: str | None = None  # User-friendly name
+    messages: list = field(default_factory=list)  # Chat history
+    plan_mode: bool = True  # Default: plan mode (read-only)
 
     # Runtime state (not persisted)
     response_queue: asyncio.Queue = field(default_factory=asyncio.Queue, repr=False)
     is_processing: bool = False
     current_block_id: int = 0
-    pending_permission: dict | None = None
 
     def next_block_id(self) -> int:
         self.current_block_id += 1
         return self.current_block_id
+
+    def add_message(self, role: str, content: str) -> None:
+        """Add a message to history."""
+        self.messages.append({
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        })
 
     def to_dict(self) -> dict:
         """Serialize for storage (excludes runtime state)."""
@@ -63,6 +73,9 @@ class Session:
             "working_dir": self.working_dir,
             "created_at": self.created_at,
             "claude_session_id": self.claude_session_id,
+            "name": self.name,
+            "messages": self.messages,
+            "plan_mode": self.plan_mode,
         }
 
     @classmethod
@@ -73,6 +86,9 @@ class Session:
             working_dir=data["working_dir"],
             created_at=data.get("created_at", datetime.now().isoformat()),
             claude_session_id=data.get("claude_session_id"),
+            name=data.get("name"),
+            messages=data.get("messages", []),
+            plan_mode=data.get("plan_mode", True),
         )
 
 
@@ -90,9 +106,16 @@ class SessionManager:
         if working_dir is None:
             working_dir = str(settings.default_working_dir)
 
+        # Generate default name: project_name #N
+        project_name = settings.project_name
+        existing = self.list_sessions()
+        count = len(existing) + 1
+        default_name = f"{project_name} #{count}"
+
         session = Session(
             session_id=session_id,
             working_dir=working_dir,
+            name=default_name,
         )
         self._sessions[session_id] = session
         self._save_session(session)
@@ -119,10 +142,17 @@ class SessionManager:
             try:
                 with open(path) as f:
                     data = json.load(f)
+                    session_id = data["session_id"]
+                    # Check if session is loaded and processing
+                    is_processing = False
+                    if session_id in self._sessions:
+                        is_processing = self._sessions[session_id].is_processing
                     sessions.append({
-                        "session_id": data["session_id"],
+                        "session_id": session_id,
                         "working_dir": data["working_dir"],
                         "created_at": data.get("created_at", "unknown"),
+                        "name": data.get("name"),
+                        "is_processing": is_processing,
                     })
             except Exception:
                 continue
@@ -136,17 +166,52 @@ class SessionManager:
         self._save_session(session)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session."""
+        """Delete a session and its Claude session data."""
         settings = get_settings()
         path = settings.session_dir / f"{session_id}.json"
 
+        # Get claude_session_id before deleting
+        claude_session_id = None
         if session_id in self._sessions:
+            claude_session_id = self._sessions[session_id].claude_session_id
             del self._sessions[session_id]
+        elif path.exists():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                    claude_session_id = data.get("claude_session_id")
+            except Exception:
+                pass
+
+        # Delete Claude's session file if it exists
+        if claude_session_id:
+            self._delete_claude_session(claude_session_id)
 
         if path.exists():
             path.unlink()
             return True
         return False
+
+    def _delete_claude_session(self, claude_session_id: str) -> None:
+        """Delete Claude's internal session file."""
+        # Claude stores sessions in ~/.claude/projects/<project>/.sessions/<session_id>.json
+        claude_dir = Path.home() / ".claude"
+
+        # Search for the session file in all project directories
+        projects_dir = claude_dir / "projects"
+        if projects_dir.exists():
+            for project_dir in projects_dir.iterdir():
+                if project_dir.is_dir():
+                    sessions_dir = project_dir / ".sessions"
+                    if sessions_dir.exists():
+                        session_file = sessions_dir / f"{claude_session_id}.json"
+                        if session_file.exists():
+                            try:
+                                session_file.unlink()
+                                print(f"Deleted Claude session: {session_file}")
+                            except Exception as e:
+                                print(f"Failed to delete Claude session {session_file}: {e}")
+                            return
 
     def _save_session(self, session: Session) -> None:
         """Save session to disk."""

@@ -1,0 +1,8 @@
+# Basil state (credentials, settings)
+.basil/
+
+# Python bytecode
+__pycache__/
+
+# Claude Code settings
+.claude/
