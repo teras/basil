@@ -45,10 +45,13 @@ impl ResponseBlock {
         }
     }
 
-    pub fn tool(block_id: u64, tool_name: &str, tool_input: serde_json::Value, more: bool) -> Self {
+    pub fn tool(block_id: u64, tool_name: &str, tool_input: serde_json::Value, tool_use_id: Option<&str>, more: bool) -> Self {
         let mut metadata = HashMap::new();
         metadata.insert("tool".to_string(), serde_json::Value::String(tool_name.to_string()));
         metadata.insert("input".to_string(), tool_input);
+        if let Some(id) = tool_use_id {
+            metadata.insert("tool_use_id".to_string(), serde_json::Value::String(id.to_string()));
+        }
         Self {
             block_id,
             content: format!("Using tool: {}", tool_name),

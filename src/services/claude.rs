@@ -5,7 +5,7 @@ use crate::models::ResponseBlock;
 use crate::services::SessionManager;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -115,9 +115,8 @@ async fn run_process(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut child = cmd.spawn()?;
 
-    // Write message to stdin
+    // Write message to stdin and close it
     if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
         stdin.write_all(message.as_bytes()).await?;
         stdin.shutdown().await?;
     }
@@ -184,14 +183,17 @@ async fn run_process(
                                             let tool_input = content.get("input")
                                                 .cloned()
                                                 .unwrap_or(serde_json::json!({}));
+                                            let tool_use_id = content.get("id")
+                                                .and_then(|v| v.as_str());
 
                                             let block_id = sessions.next_block_id(&session_id).await;
-                                            sender.send(ResponseBlock::tool(block_id, tool_name, tool_input.clone(), true)).await.ok();
+                                            sender.send(ResponseBlock::tool(block_id, tool_name, tool_input.clone(), tool_use_id, true)).await.ok();
 
                                             // Save tool message
                                             let tool_msg = serde_json::json!({
                                                 "tool": tool_name,
-                                                "input": tool_input
+                                                "input": tool_input,
+                                                "tool_use_id": tool_use_id
                                             });
                                             sessions.add_message(&session_id, "tool", &tool_msg.to_string()).await;
                                         }

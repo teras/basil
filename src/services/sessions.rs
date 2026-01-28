@@ -105,7 +105,6 @@ impl SessionManager {
 
     /// Get session runtime (for processing)
     pub async fn get_runtime(&self, session_id: &str) -> Result<()> {
-        // Ensure session is loaded
         self.get_session(session_id).await?;
         Ok(())
     }

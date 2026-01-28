@@ -619,3 +619,234 @@ body {
 .empty-state .icon {
     font-size: 4rem;
 }
+
+/* Interactive Tools Styles */
+.interactive-container {
+    align-self: flex-start;
+    max-width: 90%;
+    animation: slideIn 0.3s ease;
+}
+
+.interactive-tool {
+    background: rgba(30, 41, 59, 0.95);
+    border: 1px solid rgba(102, 126, 234, 0.3);
+    border-radius: 1rem;
+    padding: 1.25rem;
+    color: #e2e8f0;
+}
+
+.interactive-tool.submitted {
+    pointer-events: none;
+}
+
+/* AskUserQuestion Styles */
+.ask-user-question .question-block {
+    margin-bottom: 1rem;
+}
+
+.ask-user-question .question-block:last-of-type {
+    margin-bottom: 1.25rem;
+}
+
+.ask-user-question .question-header {
+    font-size: 0.75rem;
+    color: #60a5fa;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
+}
+
+.ask-user-question .question-text {
+    font-size: 1rem;
+    margin-bottom: 0.75rem;
+    line-height: 1.4;
+}
+
+.ask-user-question .question-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.ask-user-question .question-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.75rem;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0.5rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.ask-user-question .question-option:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(102, 126, 234, 0.5);
+}
+
+.ask-user-question .question-option input[type="radio"],
+.ask-user-question .question-option input[type="checkbox"] {
+    margin-top: 0.2rem;
+    accent-color: #667eea;
+    cursor: pointer;
+}
+
+.ask-user-question .option-label {
+    font-weight: 500;
+    color: #e2e8f0;
+}
+
+.ask-user-question .option-description {
+    display: block;
+    font-size: 0.85rem;
+    color: rgba(226, 232, 240, 0.6);
+    margin-top: 0.25rem;
+}
+
+.ask-user-question .other-option {
+    flex-wrap: wrap;
+}
+
+.ask-user-question .other-text-input {
+    flex: 1;
+    min-width: 200px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 0.25rem;
+    padding: 0.5rem;
+    color: white;
+    font-size: 0.9rem;
+    outline: none;
+    margin-left: auto;
+}
+
+.ask-user-question .other-text-input:focus {
+    border-color: #667eea;
+}
+
+.ask-user-question .other-text-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.question-submit-btn {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border: none;
+    border-radius: 0.5rem;
+    padding: 0.75rem 1.5rem;
+    color: white;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    width: 100%;
+}
+
+.question-submit-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+}
+
+.question-submit-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.answer-summary {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    border-radius: 0.5rem;
+    color: #4ade80;
+    font-size: 0.9rem;
+}
+
+/* ExitPlanMode Styles */
+.exit-plan-mode .plan-header {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+    color: #fbbf24;
+}
+
+.exit-plan-mode .plan-description {
+    font-size: 0.9rem;
+    color: rgba(226, 232, 240, 0.8);
+    margin-bottom: 1rem;
+    line-height: 1.4;
+}
+
+.exit-plan-mode .plan-buttons {
+    display: flex;
+    gap: 0.75rem;
+}
+
+.exit-plan-mode .plan-btn {
+    flex: 1;
+    padding: 0.75rem 1rem;
+    border: none;
+    border-radius: 0.5rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.exit-plan-mode .plan-btn.approve {
+    background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+    color: white;
+}
+
+.exit-plan-mode .plan-btn.approve:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 15px rgba(34, 197, 94, 0.4);
+}
+
+.exit-plan-mode .plan-btn.reject {
+    background: rgba(239, 68, 68, 0.2);
+    border: 1px solid rgba(239, 68, 68, 0.5);
+    color: #ef4444;
+}
+
+.exit-plan-mode .plan-btn.reject:hover {
+    background: rgba(239, 68, 68, 0.3);
+}
+
+.exit-plan-mode .plan-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.exit-plan-mode .plan-status {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.9rem;
+    text-align: center;
+    font-weight: 500;
+}
+
+.interactive-tool.submitted .plan-status {
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    color: #4ade80;
+}
+
+/* Completed interactive tool chip */
+.tool-chip.interactive-completed {
+    background: rgba(74, 222, 128, 0.1);
+    border-color: rgba(74, 222, 128, 0.3);
+}
+
+.tool-chip.interactive-completed .tool-name {
+    color: #4ade80;
+}
+
+.tool-chip.interactive-completed .tool-detail {
+    color: rgba(74, 222, 128, 0.7);
+}

@@ -269,19 +269,54 @@ async function selectSession(sessionId) {
         // Render history
         if (data.messages && data.messages.length > 0) {
             let historyToolGroup = null;
-            for (const msg of data.messages) {
+            const messages = data.messages;
+            for (let i = 0; i < messages.length; i++) {
+                const msg = messages[i];
                 if (msg.role === 'tool') {
                     // Parse tool message JSON
                     try {
                         const toolData = JSON.parse(msg.content);
-                        // Group consecutive tools
-                        if (!historyToolGroup) {
-                            historyToolGroup = document.createElement('div');
-                            historyToolGroup.className = 'tool-group';
-                            chatContainer.appendChild(historyToolGroup);
+                        const toolName = toolData.tool;
+                        const toolInput = toolData.input || {};
+
+                        // Check if this was an interactive tool (show as completed)
+                        if (isInteractiveTool(toolName)) {
+                            historyToolGroup = null;
                             document.getElementById('emptyState')?.remove();
+
+                            if (toolName === 'AskUserQuestion' && toolInput.questions) {
+                                // Render same as live, but without submit button
+                                // User's answer is visible in the next user bubble
+                                const wrapper = document.createElement('div');
+                                wrapper.className = 'interactive-container';
+                                chatContainer.appendChild(wrapper);
+                                renderAskUserQuestion(wrapper, toolInput, null);
+                                wrapper.querySelector('.question-submit-btn')?.remove();
+                                wrapper.querySelector('.interactive-tool')?.classList.add('submitted');
+                            } else if (toolName === 'ExitPlanMode') {
+                                // Render same as live, but without buttons
+                                const wrapper = document.createElement('div');
+                                wrapper.className = 'interactive-container';
+                                chatContainer.appendChild(wrapper);
+                                renderExitPlanMode(wrapper, toolInput, null);
+                                wrapper.querySelector('.plan-buttons')?.remove();
+                                wrapper.querySelector('.interactive-tool')?.classList.add('submitted');
+                            } else {
+                                const completedChip = document.createElement('div');
+                                completedChip.className = 'tool-chip interactive-completed';
+                                completedChip.innerHTML = `<span class="tool-icon">${getToolIcon(toolName)}</span><span class="tool-name">${toolName}</span><span class="tool-detail">(completed)</span>`;
+                                chatContainer.appendChild(completedChip);
+                            }
+                        } else {
+                            // Group consecutive non-interactive tools
+                            if (!historyToolGroup) {
+                                historyToolGroup = document.createElement('div');
+                                historyToolGroup.className = 'tool-group';
+                                chatContainer.appendChild(historyToolGroup);
+                                document.getElementById('emptyState')?.remove();
+                            }
+                            addToolChip(historyToolGroup, toolName, toolInput);
                         }
-                        addToolChip(historyToolGroup, toolData.tool, toolData.input || {});
                     } catch(e) {
                         console.error('Failed to parse tool message:', e);
                     }
@@ -421,12 +456,230 @@ function getToolIcon(toolName) {
         'TodoWrite': '✅',
         // User interaction
         'AskUserQuestion': '❓',
+        'ExitPlanMode': '📋',
         // Notebooks
         'NotebookEdit': '📓',
         // Multi-file
         'MultiEdit': '📑',
     };
     return icons[toolName] || '🔧';
+}
+
+// Interactive tools that need special UI
+const INTERACTIVE_TOOLS = ['AskUserQuestion', 'ExitPlanMode'];
+
+function isInteractiveTool(toolName) {
+    return INTERACTIVE_TOOLS.includes(toolName);
+}
+
+// Render AskUserQuestion UI
+function renderAskUserQuestion(container, toolInput, toolUseId) {
+    const questions = toolInput.questions || [];
+
+    const questionContainer = document.createElement('div');
+    questionContainer.className = 'interactive-tool ask-user-question';
+
+    questions.forEach((q, qIndex) => {
+        const questionDiv = document.createElement('div');
+        questionDiv.className = 'question-block';
+
+        // Question header/label
+        if (q.header) {
+            const header = document.createElement('div');
+            header.className = 'question-header';
+            header.textContent = q.header;
+            questionDiv.appendChild(header);
+        }
+
+        // Question text
+        const questionText = document.createElement('div');
+        questionText.className = 'question-text';
+        questionText.textContent = q.question;
+        questionDiv.appendChild(questionText);
+
+        // Options
+        const optionsDiv = document.createElement('div');
+        optionsDiv.className = 'question-options';
+
+        const inputType = q.multiSelect ? 'checkbox' : 'radio';
+        const inputName = `question-${qIndex}`;
+
+        (q.options || []).forEach((opt, optIndex) => {
+            const optionLabel = document.createElement('label');
+            optionLabel.className = 'question-option';
+
+            const input = document.createElement('input');
+            input.type = inputType;
+            input.name = inputName;
+            input.value = opt.label;
+            input.dataset.questionIndex = qIndex;
+            input.dataset.optionIndex = optIndex;
+
+            const labelText = document.createElement('span');
+            labelText.className = 'option-label';
+            labelText.textContent = opt.label;
+
+            optionLabel.appendChild(input);
+            optionLabel.appendChild(labelText);
+
+            if (opt.description) {
+                const desc = document.createElement('span');
+                desc.className = 'option-description';
+                desc.textContent = opt.description;
+                optionLabel.appendChild(desc);
+            }
+
+            optionsDiv.appendChild(optionLabel);
+        });
+
+        // "Other" option with text input
+        const otherLabel = document.createElement('label');
+        otherLabel.className = 'question-option other-option';
+
+        const otherInput = document.createElement('input');
+        otherInput.type = inputType;
+        otherInput.name = inputName;
+        otherInput.value = '__other__';
+        otherInput.dataset.questionIndex = qIndex;
+
+        const otherText = document.createElement('span');
+        otherText.className = 'option-label';
+        otherText.textContent = 'Other:';
+
+        const otherTextInput = document.createElement('input');
+        otherTextInput.type = 'text';
+        otherTextInput.className = 'other-text-input';
+        otherTextInput.placeholder = 'Type your answer...';
+
+        // Enable text input when "Other" is selected
+        otherInput.addEventListener('change', () => {
+            if (otherInput.checked) otherTextInput.focus();
+        });
+
+        // Auto-select "Other" when typing in text field
+        otherTextInput.addEventListener('input', () => {
+            if (otherTextInput.value.trim()) {
+                otherInput.checked = true;
+            }
+        });
+
+        // Submit on Enter
+        otherTextInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                questionContainer.querySelector('.question-submit-btn')?.click();
+            }
+        });
+
+        otherLabel.appendChild(otherInput);
+        otherLabel.appendChild(otherText);
+        otherLabel.appendChild(otherTextInput);
+        optionsDiv.appendChild(otherLabel);
+
+        questionDiv.appendChild(optionsDiv);
+        questionContainer.appendChild(questionDiv);
+    });
+
+    // Submit button
+    const submitBtn = document.createElement('button');
+    submitBtn.className = 'question-submit-btn';
+    submitBtn.textContent = 'Submit Answer';
+    submitBtn.addEventListener('click', () => submitQuestionResponse(questionContainer, toolUseId, questions));
+    questionContainer.appendChild(submitBtn);
+
+    container.appendChild(questionContainer);
+    scrollToBottom();
+}
+
+// Render ExitPlanMode UI
+function renderExitPlanMode(container, toolInput, toolUseId) {
+    const planContainer = document.createElement('div');
+    planContainer.className = 'interactive-tool exit-plan-mode';
+
+    const header = document.createElement('div');
+    header.className = 'plan-header';
+    header.textContent = '📋 Plan Ready for Review';
+    planContainer.appendChild(header);
+
+    const description = document.createElement('div');
+    description.className = 'plan-description';
+    description.textContent = 'Claude has finished planning. Review the plan and approve to proceed with implementation.';
+    planContainer.appendChild(description);
+
+    const buttonsDiv = document.createElement('div');
+    buttonsDiv.className = 'plan-buttons';
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'plan-btn approve';
+    approveBtn.textContent = '✓ Approve Plan';
+    approveBtn.addEventListener('click', () => submitPlanResponse(planContainer, toolUseId, true));
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'plan-btn reject';
+    rejectBtn.textContent = '✗ Request Changes';
+    rejectBtn.addEventListener('click', () => submitPlanResponse(planContainer, toolUseId, false));
+
+    buttonsDiv.appendChild(approveBtn);
+    buttonsDiv.appendChild(rejectBtn);
+    planContainer.appendChild(buttonsDiv);
+
+    container.appendChild(planContainer);
+    scrollToBottom();
+}
+
+// Submit response to AskUserQuestion - sends as normal chat message
+function submitQuestionResponse(container, toolUseId, questions) {
+    const selectedValues = [];
+
+    questions.forEach((q, qIndex) => {
+        const inputs = container.querySelectorAll(`input[data-question-index="${qIndex}"]:checked`);
+
+        const values = Array.from(inputs).map(input => {
+            if (input.value === '__other__') {
+                const otherText = input.parentElement.querySelector('.other-text-input');
+                const text = otherText ? otherText.value.trim() : '';
+                return text ? 'Other: ' + text : '';
+            }
+            return input.value;
+        }).filter(v => v);
+
+        selectedValues.push(...values);
+    });
+
+    if (selectedValues.length === 0) return;
+
+    // Hide submit button, keep visual appearance
+    container.querySelector('.question-submit-btn')?.remove();
+    container.classList.add('submitted');
+
+    const answerText = selectedValues.join(', ');
+
+    // Send as normal chat message
+    messageInput.value = answerText;
+    sendMessage();
+}
+
+// Submit response to ExitPlanMode - sends as normal chat message
+function submitPlanResponse(container, toolUseId, approved) {
+    // Hide buttons, keep visual appearance
+    container.querySelector('.plan-buttons')?.remove();
+    container.classList.add('submitted');
+
+    // Show status
+    const status = document.createElement('div');
+    status.className = 'plan-status';
+    status.textContent = approved ? '✓ Plan Approved' : '✗ Changes Requested';
+    container.appendChild(status);
+
+    // If approved, switch to execute mode
+    if (approved) {
+        planMode = false;
+        updatePlanModeUI();
+    }
+
+    // Send as normal chat message
+    messageInput.value = approved ? 'Yes, proceed with the plan.' : 'No, I\'d like changes to the plan.';
+    sendMessage();
 }
 
 function formatToolInput(toolName, input) {
@@ -468,6 +721,80 @@ async function ensureSession() {
     return currentSession;
 }
 
+// Poll for response blocks from Claude
+async function pollResponses(sessionId) {
+    let currentMsg = null;
+    let currentToolGroup = null;
+    let lastText = '';
+
+    let more = true;
+    while (more) {
+        const resp = await fetch(`/api/chat/next?timeout=30`, {
+            headers: { 'X-Session': sessionId }
+        });
+        const block = await resp.json();
+
+        if (block.type === 'text' && block.content) {
+            if (block.content !== lastText) {
+                currentToolGroup = null;
+                currentMsg = createMessageElement('assistant');
+                renderMarkdown(currentMsg, block.content);
+                lastText = block.content;
+            }
+        } else if (block.type === 'tool') {
+            const toolName = block.tool || 'tool';
+            const toolInput = block.input || {};
+            const toolUseId = block.tool_use_id;
+
+            console.log('Tool block received:', { toolName, toolUseId, block });
+
+            if (isInteractiveTool(toolName) && toolUseId) {
+                currentToolGroup = null;
+
+                const interactiveContainer = document.createElement('div');
+                interactiveContainer.className = 'interactive-container';
+                chatContainer.appendChild(interactiveContainer);
+                document.getElementById('emptyState')?.remove();
+
+                if (toolName === 'AskUserQuestion') {
+                    renderAskUserQuestion(interactiveContainer, toolInput, toolUseId);
+                } else if (toolName === 'ExitPlanMode') {
+                    renderExitPlanMode(interactiveContainer, toolInput, toolUseId);
+                }
+
+                // Stop polling and backend process - user needs to answer via new sendMessage
+                fetch('/api/chat/stop', { method: 'POST', headers: { 'X-Session': sessionId } });
+                more = false;
+                break;
+            } else {
+                if (!currentToolGroup) {
+                    currentToolGroup = document.createElement('div');
+                    currentToolGroup.className = 'tool-group';
+                    if (typingIndicator.classList.contains('active')) {
+                        chatContainer.insertBefore(currentToolGroup, typingIndicator);
+                    } else {
+                        chatContainer.appendChild(currentToolGroup);
+                    }
+                    document.getElementById('emptyState')?.remove();
+                }
+                addToolChip(currentToolGroup, toolName, toolInput);
+                currentMsg = currentToolGroup;
+            }
+        } else if (block.type === 'error') {
+            currentToolGroup = null;
+            const errMsg = createMessageElement('system');
+            errMsg.textContent = block.content;
+        }
+
+        more = block.more;
+    }
+
+    typingIndicator.classList.remove('active');
+    isProcessing = false;
+    setButtonMode(false);
+
+}
+
 async function sendMessage() {
     const text = messageInput.value.trim();
     if (!text) return;
@@ -497,55 +824,8 @@ async function sendMessage() {
             body: JSON.stringify({ text: text, plan_mode: planMode })
         });
 
-        // Poll for responses - each text block becomes its own bubble
-        let currentMsg = null;
-        let currentToolGroup = null;
-        let lastText = '';
-
-        let more = true;
-        while (more) {
-            const resp = await fetch(`/api/chat/next?timeout=30`, {
-                headers: { 'X-Session': sessionId }
-            });
-            const block = await resp.json();
-
-            if (block.type === 'text' && block.content) {
-                // Check if this is new/different text (not just the same text growing)
-                if (block.content !== lastText) {
-                    // Text breaks the tool group
-                    currentToolGroup = null;
-                    // Create new bubble for this text
-                    currentMsg = createMessageElement('assistant');
-                    renderMarkdown(currentMsg, block.content);
-                    lastText = block.content;
-                }
-            } else if (block.type === 'tool') {
-                const toolName = block.tool || 'tool';
-                const toolInput = block.input || {};
-                // Add to current tool group or create new one
-                if (!currentToolGroup) {
-                    currentToolGroup = document.createElement('div');
-                    currentToolGroup.className = 'tool-group';
-                    if (typingIndicator.classList.contains('active')) {
-                        chatContainer.insertBefore(currentToolGroup, typingIndicator);
-                    } else {
-                        chatContainer.appendChild(currentToolGroup);
-                    }
-                    document.getElementById('emptyState')?.remove();
-                }
-                addToolChip(currentToolGroup, toolName, toolInput);
-                currentMsg = currentToolGroup;
-            } else if (block.type === 'error') {
-                currentToolGroup = null;
-                const errMsg = createMessageElement('system');
-                errMsg.textContent = block.content;
-            }
-
-            more = block.more;
-        }
-
-        // Done - hide typing and deactivate tools
-        typingIndicator.classList.remove('active');
+        // Poll for responses
+        await pollResponses(sessionId);
 
     } catch (err) {
         typingIndicator.classList.remove('active');
