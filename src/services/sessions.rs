@@ -273,19 +273,6 @@ impl SessionManager {
         self.update_session(session_id).await
     }
 
-    /// Change working directory
-    pub async fn change_dir(&self, session_id: &str, dir: String) -> Result<()> {
-        {
-            let mut sessions = self.sessions.write().await;
-            if let Some(runtime) = sessions.get_mut(session_id) {
-                runtime.data.working_dir = dir;
-            } else {
-                return Err(AppError::SessionNotFound(session_id.to_string()));
-            }
-        }
-        self.update_session(session_id).await
-    }
-
     /// Delete session
     pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
         let settings = get_settings();

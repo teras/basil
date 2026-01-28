@@ -1,9 +1,8 @@
 //! Embedded web UI serving.
 
 use axum::{
-    extract::Path,
-    http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    http::header,
+    response::{Html, IntoResponse},
     routing::get,
     Router,
 };
@@ -22,45 +21,13 @@ async fn serve_ui() -> impl IntoResponse {
     Html(UI_HTML)
 }
 
-async fn serve_asset(Path(path): Path<String>) -> Response {
-    match path.as_str() {
-        "style.css" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/css")],
-            STYLE_CSS,
-        )
-            .into_response(),
-        "vendor/marked.min.js" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/javascript")],
-            MARKED_JS,
-        )
-            .into_response(),
-        "vendor/highlight.min.js" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/javascript")],
-            HIGHLIGHT_JS,
-        )
-            .into_response(),
-        "vendor/github-dark.min.css" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/css")],
-            HIGHLIGHT_CSS,
-        )
-            .into_response(),
-        "app.js" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/javascript")],
-            APP_JS,
-        )
-            .into_response(),
-        _ => (StatusCode::NOT_FOUND, "Not found").into_response(),
-    }
-}
-
-/// Create UI routes (GET / and GET /assets/*)
+/// Create UI routes
 pub fn ui_route() -> Router {
     Router::new()
         .route("/", get(serve_ui))
-        .route("/assets/{*path}", get(serve_asset))
+        .route("/assets/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css")], STYLE_CSS) }))
+        .route("/assets/app.js", get(|| async { ([(header::CONTENT_TYPE, "application/javascript")], APP_JS) }))
+        .route("/assets/vendor/marked.min.js", get(|| async { ([(header::CONTENT_TYPE, "application/javascript")], MARKED_JS) }))
+        .route("/assets/vendor/highlight.min.js", get(|| async { ([(header::CONTENT_TYPE, "application/javascript")], HIGHLIGHT_JS) }))
+        .route("/assets/vendor/github-dark.min.css", get(|| async { ([(header::CONTENT_TYPE, "text/css")], HIGHLIGHT_CSS) }))
 }

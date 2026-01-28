@@ -568,6 +568,14 @@ body {
     transform: none;
 }
 
+#sendBtn.stop-mode {
+    background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+}
+
+#sendBtn.stop-mode:hover {
+    box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
+}
+
 .typing-indicator {
     display: none;
     align-self: flex-start;

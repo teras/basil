@@ -19,6 +19,7 @@ let currentSession = null;
 let userScrolledUp = false;
 let programmaticScroll = false;
 let planMode = true;  // Default: locked (plan mode)
+let isProcessing = false;
 
 // Plan mode toggle
 const planModeBtn = document.getElementById('planModeBtn');
@@ -477,7 +478,8 @@ async function sendMessage() {
     const userMsg = createMessageElement('user');
     userMsg.textContent = text;
 
-    sendBtn.disabled = true;
+    isProcessing = true;
+    setButtonMode(true);
     typingIndicator.classList.add('active');
     chatContainer.appendChild(typingIndicator);
     scrollToBottom();
@@ -551,11 +553,46 @@ async function sendMessage() {
         errMsg.textContent = 'Error: ' + err.message;
     }
 
-    sendBtn.disabled = false;
+    isProcessing = false;
+    setButtonMode(false);
     messageInput.focus();
 }
 
-sendBtn.addEventListener('click', sendMessage);
+function setButtonMode(stopMode) {
+    const btnText = sendBtn.querySelector('.btn-text');
+    const btnIcon = sendBtn.querySelector('.btn-icon');
+
+    if (stopMode) {
+        sendBtn.classList.add('stop-mode');
+        btnText.textContent = 'Stop';
+        btnIcon.textContent = '■';
+    } else {
+        sendBtn.classList.remove('stop-mode');
+        btnText.textContent = 'Send';
+        btnIcon.textContent = '→';
+    }
+}
+
+async function stopChat() {
+    if (!isProcessing || !currentSession) return;
+
+    try {
+        await fetch('/api/chat/stop', {
+            method: 'POST',
+            headers: { 'X-Session': currentSession }
+        });
+    } catch (err) {
+        console.error('Failed to stop:', err);
+    }
+}
+
+sendBtn.addEventListener('click', () => {
+    if (isProcessing) {
+        stopChat();
+    } else {
+        sendMessage();
+    }
+});
 
 // Auto-resize textarea
 let lastTextareaHeight = 52; // min-height

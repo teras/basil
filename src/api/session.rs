@@ -14,8 +14,6 @@ use crate::services::SessionManager;
 #[derive(Deserialize)]
 pub struct NewSessionRequest {
     working_dir: Option<String>,
-    #[allow(dead_code)]
-    name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -52,11 +50,6 @@ pub struct SetModeRequest {
     plan_mode: bool,
 }
 
-#[derive(Deserialize)]
-pub struct ChangeDirRequest {
-    text: String,
-}
-
 #[derive(Serialize)]
 struct OkResponse {
     ok: bool,
@@ -64,8 +57,6 @@ struct OkResponse {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_mode: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    working_dir: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -133,7 +124,6 @@ async fn rename_session(
         ok: true,
         name: Some(req.name),
         plan_mode: None,
-        working_dir: None,
     }))
 }
 
@@ -147,21 +137,6 @@ async fn set_session_mode(
         ok: true,
         name: None,
         plan_mode: Some(req.plan_mode),
-        working_dir: None,
-    }))
-}
-
-async fn change_directory(
-    State(sessions): State<Arc<SessionManager>>,
-    Path(session_id): Path<String>,
-    Json(req): Json<ChangeDirRequest>,
-) -> Result<Json<OkResponse>> {
-    sessions.change_dir(&session_id, req.text.clone()).await?;
-    Ok(Json(OkResponse {
-        ok: true,
-        name: None,
-        plan_mode: None,
-        working_dir: Some(req.text),
     }))
 }
 
@@ -173,6 +148,5 @@ pub fn routes(sessions: Arc<SessionManager>) -> Router {
         .route("/session/:session_id", delete(delete_session_handler))
         .route("/session/:session_id/rename", patch(rename_session))
         .route("/session/:session_id/mode", patch(set_session_mode))
-        .route("/session/:session_id/cd", post(change_directory))
         .with_state(sessions)
 }
