@@ -1,8 +1,8 @@
 # Basil state (credentials, settings)
 .basil/
 
-# Python bytecode
-__pycache__/
+# Rust build files
+target/
 
 # Claude Code settings
 .claude/

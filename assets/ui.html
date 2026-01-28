@@ -388,6 +388,48 @@
             border-radius: 1rem;
         }
 
+        .tool-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            align-self: flex-start;
+            max-width: 90%;
+            animation: slideIn 0.3s ease;
+        }
+
+        .tool-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.4rem 0.75rem;
+            background: rgba(30,41,59,0.8);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 1rem;
+            font-size: 0.8rem;
+            white-space: nowrap;
+            max-width: 400px;
+        }
+
+        .tool-chip .tool-icon {
+            font-size: 0.85rem;
+            flex-shrink: 0;
+        }
+
+        .tool-chip .tool-name {
+            color: #60a5fa;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+
+        .tool-chip .tool-detail {
+            color: rgba(226, 232, 240, 0.7);
+            font-family: monospace;
+            font-size: 0.75rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
         .message.tool-message {
             padding: 0.5rem 1rem;
             background: rgba(30,41,59,0.7);
@@ -645,7 +687,7 @@
         const messageInput = document.getElementById('messageInput');
         const sendBtn = document.getElementById('sendBtn');
         const typingIndicator = document.getElementById('typingIndicator');
-        const emptyState = document.getElementById('emptyState');
+        // Note: emptyState is recreated by clearChat(), so always query DOM when removing
         const sessionBtn = document.getElementById('sessionBtn');
         const sessionDropdown = document.getElementById('sessionDropdown');
         const sessionList = document.getElementById('sessionList');
@@ -760,6 +802,8 @@
             sessionLabel.textContent = 'New Session';
             clearChat();
             sessionDropdown.classList.remove('open');
+            planMode = true;           // Reset to plan mode
+            updatePlanModeUI();        // Update UI
         });
 
         async function loadSessions() {
@@ -902,18 +946,26 @@
 
                 // Render history
                 if (data.messages && data.messages.length > 0) {
+                    let historyToolGroup = null;
                     for (const msg of data.messages) {
                         if (msg.role === 'tool') {
                             // Parse tool message JSON
                             try {
                                 const toolData = JSON.parse(msg.content);
-                                const el = createMessageElement('assistant');
-                                el.classList.add('tool-message');
-                                addToolAction(el, toolData.tool, toolData.input || {});
+                                // Group consecutive tools
+                                if (!historyToolGroup) {
+                                    historyToolGroup = document.createElement('div');
+                                    historyToolGroup.className = 'tool-group';
+                                    chatContainer.appendChild(historyToolGroup);
+                                    document.getElementById('emptyState')?.remove();
+                                }
+                                addToolChip(historyToolGroup, toolData.tool, toolData.input || {});
                             } catch(e) {
                                 console.error('Failed to parse tool message:', e);
                             }
                         } else {
+                            // Non-tool message breaks tool group
+                            historyToolGroup = null;
                             const el = createMessageElement(msg.role);
                             if (msg.role === 'assistant') {
                                 renderMarkdown(el, msg.content);
@@ -955,7 +1007,7 @@
         }
 
         function createMessageElement(type) {
-            if (emptyState) emptyState.remove();
+            document.getElementById('emptyState')?.remove();
 
             const msg = document.createElement('div');
             msg.className = `message ${type}`;
@@ -1013,6 +1065,18 @@
             action.innerHTML = `<span class="tool-icon">${icon}</span><span class="tool-name">${toolName}</span><span class="tool-detail">${detail}</span>`;
 
             actionsDiv.appendChild(action);
+            scrollToBottom();
+        }
+
+        function addToolChip(container, toolName, toolInput) {
+            const chip = document.createElement('div');
+            chip.className = 'tool-chip';
+
+            const icon = getToolIcon(toolName);
+            const detail = formatToolInput(toolName, toolInput);
+            chip.innerHTML = `<span class="tool-icon">${icon}</span><span class="tool-name">${toolName}</span><span class="tool-detail">${detail}</span>`;
+
+            container.appendChild(chip);
             scrollToBottom();
         }
 
@@ -1112,6 +1176,7 @@
 
                 // Poll for responses - each text block becomes its own bubble
                 let currentMsg = null;
+                let currentToolGroup = null;
                 let lastText = '';
 
                 let more = true;
@@ -1124,6 +1189,8 @@
                     if (block.type === 'text' && block.content) {
                         // Check if this is new/different text (not just the same text growing)
                         if (block.content !== lastText) {
+                            // Text breaks the tool group
+                            currentToolGroup = null;
                             // Create new bubble for this text
                             currentMsg = createMessageElement('assistant');
                             renderMarkdown(currentMsg, block.content);
@@ -1132,12 +1199,21 @@
                     } else if (block.type === 'tool') {
                         const toolName = block.tool || 'tool';
                         const toolInput = block.input || {};
-                        // Create tool bubble
-                        const toolMsg = createMessageElement('assistant');
-                        toolMsg.classList.add('tool-message');
-                        addToolAction(toolMsg, toolName, toolInput);
-                        currentMsg = toolMsg;
+                        // Add to current tool group or create new one
+                        if (!currentToolGroup) {
+                            currentToolGroup = document.createElement('div');
+                            currentToolGroup.className = 'tool-group';
+                            if (typingIndicator.classList.contains('active')) {
+                                chatContainer.insertBefore(currentToolGroup, typingIndicator);
+                            } else {
+                                chatContainer.appendChild(currentToolGroup);
+                            }
+                            document.getElementById('emptyState')?.remove();
+                        }
+                        addToolChip(currentToolGroup, toolName, toolInput);
+                        currentMsg = currentToolGroup;
                     } else if (block.type === 'error') {
+                        currentToolGroup = null;
                         const errMsg = createMessageElement('system');
                         errMsg.textContent = block.content;
                     }
