@@ -822,6 +822,68 @@ body {
     transform: none;
 }
 
+.exit-plan-mode .plan-content {
+    margin: 1rem 0;
+    padding: 1rem;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 0.5rem;
+    max-height: 400px;
+    overflow-y: auto;
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.exit-plan-mode .plan-content h1,
+.exit-plan-mode .plan-content h2,
+.exit-plan-mode .plan-content h3 {
+    margin-top: 1rem;
+    margin-bottom: 0.5rem;
+    color: #60a5fa;
+}
+
+.exit-plan-mode .plan-content h1:first-child,
+.exit-plan-mode .plan-content h2:first-child {
+    margin-top: 0;
+}
+
+.exit-plan-mode .plan-content code {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 0.15rem 0.3rem;
+    border-radius: 0.25rem;
+    font-size: 0.85em;
+}
+
+.exit-plan-mode .plan-content pre {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 0.75rem;
+    border-radius: 0.5rem;
+    overflow-x: auto;
+    margin: 0.5rem 0;
+}
+
+.exit-plan-mode .plan-content ul,
+.exit-plan-mode .plan-content ol {
+    margin-left: 1.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.exit-plan-mode .plan-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+}
+
+.exit-plan-mode .plan-content th,
+.exit-plan-mode .plan-content td {
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 0.5rem;
+    text-align: left;
+}
+
+.exit-plan-mode .plan-content th {
+    background: rgba(0, 0, 0, 0.2);
+}
+
 .exit-plan-mode .plan-status {
     margin-top: 1rem;
     padding: 0.75rem;

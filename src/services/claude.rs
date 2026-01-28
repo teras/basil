@@ -186,8 +186,11 @@ async fn run_process(
                                             let tool_use_id = content.get("id")
                                                 .and_then(|v| v.as_str());
 
+                                            // Interactive tools signal end of processing (user must respond)
+                                            let is_interactive = tool_name == "AskUserQuestion" || tool_name == "ExitPlanMode";
+
                                             let block_id = sessions.next_block_id(&session_id).await;
-                                            sender.send(ResponseBlock::tool(block_id, tool_name, tool_input.clone(), tool_use_id, true)).await.ok();
+                                            sender.send(ResponseBlock::tool(block_id, tool_name, tool_input.clone(), tool_use_id, !is_interactive)).await.ok();
 
                                             // Save tool message
                                             let tool_msg = serde_json::json!({
@@ -196,6 +199,12 @@ async fn run_process(
                                                 "tool_use_id": tool_use_id
                                             });
                                             sessions.add_message(&session_id, "tool", &tool_msg.to_string()).await;
+
+                                            // Stop processing for interactive tools
+                                            if is_interactive {
+                                                child.kill().await.ok();
+                                                return Ok(());
+                                            }
                                         }
                                     }
                                 }

@@ -601,10 +601,18 @@ function renderExitPlanMode(container, toolInput, toolUseId) {
     header.textContent = '📋 Plan Ready for Review';
     planContainer.appendChild(header);
 
-    const description = document.createElement('div');
-    description.className = 'plan-description';
-    description.textContent = 'Claude has finished planning. Review the plan and approve to proceed with implementation.';
-    planContainer.appendChild(description);
+    // Show the plan content if available
+    if (toolInput.plan) {
+        const planContent = document.createElement('div');
+        planContent.className = 'plan-content';
+        renderMarkdown(planContent, toolInput.plan);
+        planContainer.appendChild(planContent);
+    } else {
+        const description = document.createElement('div');
+        description.className = 'plan-description';
+        description.textContent = 'Claude has finished planning. Review the plan above and approve to proceed with implementation.';
+        planContainer.appendChild(description);
+    }
 
     const buttonsDiv = document.createElement('div');
     buttonsDiv.className = 'plan-buttons';
@@ -761,11 +769,7 @@ async function pollResponses(sessionId) {
                 } else if (toolName === 'ExitPlanMode') {
                     renderExitPlanMode(interactiveContainer, toolInput, toolUseId);
                 }
-
-                // Stop polling and backend process - user needs to answer via new sendMessage
-                fetch('/api/chat/stop', { method: 'POST', headers: { 'X-Session': sessionId } });
-                more = false;
-                break;
+                // Backend sends more:false for interactive tools, polling stops naturally
             } else {
                 if (!currentToolGroup) {
                     currentToolGroup = document.createElement('div');
