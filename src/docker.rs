@@ -94,8 +94,17 @@ pub fn init_project(project_dir: &Path) -> Result<PathBuf, Box<dyn std::error::E
 
     let claude_dir = get_claude_dir(project_dir);
 
-    // Skip if already initialized
-    if claude_dir.join(".credentials.json").exists() {
+    // If already initialized, just refresh credentials file
+    if claude_dir.exists() {
+        tracing::debug!("Refreshing credentials");
+        std::fs::copy(&source_credentials, claude_dir.join(".credentials.json"))?;
+
+        // Also refresh .claude.json if it exists
+        let source_claude_json = home.join(".claude.json");
+        if source_claude_json.exists() {
+            std::fs::copy(&source_claude_json, claude_dir.join(".claude.json"))?;
+        }
+
         return Ok(claude_dir);
     }
 
