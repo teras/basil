@@ -39,9 +39,9 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Enable web UI
-    #[arg(short, long)]
-    ui: bool,
+    /// Disable web UI (enabled by default)
+    #[arg(long)]
+    no_ui: bool,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -107,7 +107,7 @@ async fn main() {
     });
 
     // Run server
-    run_server(&project_dir, port, args.ui, container_name).await;
+    run_server(&project_dir, port, !args.no_ui, container_name).await;
 }
 
 /// Custom request logging middleware
