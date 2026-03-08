@@ -685,9 +685,12 @@ function submitPlanResponse(container, toolUseId, approved) {
         updatePlanModeUI();
     }
 
-    // Send as normal chat message
-    messageInput.value = approved ? 'Yes, proceed with the plan.' : 'No, I\'d like changes to the plan.';
-    sendMessage();
+    // Send message only if approved
+    if (approved) {
+        messageInput.value = 'Yes, proceed with the plan.';
+        sendMessage();
+    }
+    // If not approved, user types their own feedback
 }
 
 function formatToolInput(toolName, input) {
@@ -939,6 +942,198 @@ document.getElementById('scrollDownBtn').addEventListener('click', () => {
     userScrolledUp = false;
 });
 
+// ============================================================================
+// Mount Request Management
+// ============================================================================
+
+let pendingMountsCount = 0;
+let mountDialogVisible = false;
+
+// Check for pending mounts periodically
+async function checkPendingMounts() {
+    try {
+        const resp = await fetch('/api/mounts');
+        if (!resp.ok) return;
+
+        const data = await resp.json();
+        pendingMountsCount = data.pending_count;
+
+        // Update UI indicator
+        updateMountIndicator();
+
+        // Show dialog if there are pending mounts and dialog not already visible
+        if (pendingMountsCount > 0 && !mountDialogVisible) {
+            showMountDialog(data.mounts.filter(m => !m.approved));
+        }
+    } catch (e) {
+        console.error('Failed to check mounts:', e);
+    }
+}
+
+function updateMountIndicator() {
+    let indicator = document.getElementById('mountIndicator');
+
+    if (pendingMountsCount === 0) {
+        if (indicator) indicator.remove();
+        return;
+    }
+
+    if (!indicator) {
+        indicator = document.createElement('div');
+        indicator.id = 'mountIndicator';
+        indicator.className = 'mount-indicator';
+        indicator.addEventListener('click', async () => {
+            const resp = await fetch('/api/mounts');
+            const data = await resp.json();
+            showMountDialog(data.mounts.filter(m => !m.approved));
+        });
+        document.querySelector('.header-left').appendChild(indicator);
+    }
+
+    indicator.innerHTML = `<span class="mount-icon">📁</span><span class="mount-count">${pendingMountsCount}</span>`;
+    indicator.title = `${pendingMountsCount} pending mount request(s)`;
+}
+
+function showMountDialog(pendingMounts) {
+    if (pendingMounts.length === 0) {
+        hideMountDialog();
+        return;
+    }
+
+    mountDialogVisible = true;
+
+    // Remove existing dialog
+    const existing = document.getElementById('mountDialog');
+    if (existing) existing.remove();
+
+    const dialog = document.createElement('div');
+    dialog.id = 'mountDialog';
+    dialog.className = 'mount-dialog';
+
+    const header = document.createElement('div');
+    header.className = 'mount-dialog-header';
+    header.innerHTML = `<span class="mount-dialog-icon">📁</span> Mount Requests`;
+    dialog.appendChild(header);
+
+    const description = document.createElement('div');
+    description.className = 'mount-dialog-description';
+    description.textContent = 'Claude is requesting access to the following directories:';
+    dialog.appendChild(description);
+
+    const mountList = document.createElement('div');
+    mountList.className = 'mount-list';
+
+    pendingMounts.forEach(mount => {
+        const item = document.createElement('div');
+        item.className = 'mount-item';
+        item.dataset.index = mount.index;
+
+        const info = document.createElement('div');
+        info.className = 'mount-info';
+
+        const paths = document.createElement('div');
+        paths.className = 'mount-paths';
+        paths.innerHTML = `<span class="mount-host">${escapeHtml(mount.host)}</span> → <span class="mount-target">${escapeHtml(mount.target)}</span>`;
+        info.appendChild(paths);
+
+        const mode = document.createElement('div');
+        mode.className = 'mount-mode';
+        mode.textContent = mount.readonly ? '(read-only)' : '(read-write)';
+        info.appendChild(mode);
+
+        if (mount.reason) {
+            const reason = document.createElement('div');
+            reason.className = 'mount-reason';
+            reason.textContent = mount.reason;
+            info.appendChild(reason);
+        }
+
+        item.appendChild(info);
+
+        const buttons = document.createElement('div');
+        buttons.className = 'mount-buttons';
+
+        const approveBtn = document.createElement('button');
+        approveBtn.className = 'mount-btn approve';
+        approveBtn.textContent = '✓';
+        approveBtn.title = 'Approve';
+        approveBtn.addEventListener('click', () => handleMountAction(mount.index, true, item));
+
+        const rejectBtn = document.createElement('button');
+        rejectBtn.className = 'mount-btn reject';
+        rejectBtn.textContent = '✗';
+        rejectBtn.title = 'Reject';
+        rejectBtn.addEventListener('click', () => handleMountAction(mount.index, false, item));
+
+        buttons.appendChild(approveBtn);
+        buttons.appendChild(rejectBtn);
+        item.appendChild(buttons);
+
+        mountList.appendChild(item);
+    });
+
+    dialog.appendChild(mountList);
+
+    const footer = document.createElement('div');
+    footer.className = 'mount-dialog-footer';
+    footer.innerHTML = '<small>After approval, use the restart_container tool to apply changes</small>';
+    dialog.appendChild(footer);
+
+    document.body.appendChild(dialog);
+}
+
+function hideMountDialog() {
+    mountDialogVisible = false;
+    const dialog = document.getElementById('mountDialog');
+    if (dialog) dialog.remove();
+}
+
+async function handleMountAction(index, approve, itemElement) {
+    const endpoint = approve ? 'approve' : 'reject';
+
+    try {
+        itemElement.classList.add('processing');
+
+        const resp = await fetch(`/api/mounts/${index}/${endpoint}`, {
+            method: 'PATCH'
+        });
+
+        const data = await resp.json();
+
+        if (data.ok) {
+            // Remove the item with animation
+            itemElement.classList.add('done');
+            itemElement.classList.add(approve ? 'approved' : 'rejected');
+
+            setTimeout(() => {
+                itemElement.remove();
+
+                // Check if any items left
+                const mountList = document.querySelector('.mount-list');
+                if (mountList && mountList.children.length === 0) {
+                    hideMountDialog();
+                }
+
+                // Refresh mount count
+                checkPendingMounts();
+            }, 300);
+        }
+    } catch (e) {
+        console.error('Mount action failed:', e);
+        itemElement.classList.remove('processing');
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Poll for pending mounts every 2 seconds
+setInterval(checkPendingMounts, 2000);
+
 // Initialize
 updatePlanModeUI();  // Set initial button state
 loadLastSession();
+checkPendingMounts();

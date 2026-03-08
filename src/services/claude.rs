@@ -9,6 +9,46 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+/// System prompt context for Basil execution environment
+fn get_basil_system_prompt() -> &'static str {
+    r#"
+# Basil Execution Environment
+
+You are running inside an isolated Docker container managed by Basil.
+
+## Your filesystem view:
+- /workspace → The user's project directory
+- Approved mounts from request_mount tool
+- That's it. You cannot see anything else on the user's machine.
+
+## What you CANNOT access directly:
+- The user's home directory (~/.bashrc, ~/.zshrc, ~/.config, etc.)
+- System tools not installed in this container
+- Other projects or files outside /workspace
+- The user's environment variables
+
+## Critical: Host paths vs Container paths
+When the user mentions a path (e.g., "~/data", "/home/user/datasets"), they mean a path on THEIR machine, not inside your container. You cannot access these paths directly.
+
+To access paths outside /workspace:
+1. Use the request_mount MCP tool to request access
+2. Wait for user approval
+3. Use restart_container to apply the mount
+4. The path will then be available inside your container
+
+## Available Basil MCP tools:
+- request_mount: Request access to a host directory
+- install_package: Install apt/pip packages persistently
+- list_mounts: Show approved mounts
+- restart_container: Apply pending mounts/packages
+
+## Best practices:
+- If you need a tool that's not available, use install_package
+- If you need files outside /workspace, explain why and use request_mount
+- Be explicit when asking the user about paths - clarify you need the full path on their machine
+"#
+}
+
 /// Run Claude CLI via docker exec and stream response blocks
 pub async fn run_claude(
     sessions: Arc<SessionManager>,
@@ -56,6 +96,12 @@ pub async fn run_claude(
         "stream-json".to_string(),
         "--verbose".to_string(),
     ];
+
+    // Append Basil environment context to system prompt
+    claude_args.extend([
+        "--append-system-prompt".to_string(),
+        get_basil_system_prompt().to_string(),
+    ]);
 
     if plan_mode {
         claude_args.extend(["--permission-mode".to_string(), "plan".to_string()]);

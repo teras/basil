@@ -6,6 +6,7 @@ mod api;
 mod config;
 mod docker;
 mod error;
+mod mcp;
 mod models;
 mod services;
 mod ui;
@@ -83,8 +84,8 @@ async fn main() {
         None => docker::get_project_port(&project_dir).await,
     };
 
-    // Init project (copy credentials)
-    if let Err(e) = docker::init_project(&project_dir) {
+    // Init project (copy credentials, inject MCP config)
+    if let Err(e) = docker::init_project(&project_dir, port) {
         tracing::error!("{}", e);
         std::process::exit(1);
     }
@@ -164,12 +165,13 @@ async fn run_server(project_dir: &PathBuf, port: u16, serve_ui: bool, container_
     init_settings(settings);
     let settings = get_settings();
 
-    // Create session manager
+    // Create session manager and MCP state
     let sessions = SessionManager::new();
+    let mcp_state = mcp::McpState::new();
 
     // Build router
     let mut app = Router::new()
-        .merge(api::api_router(sessions.clone()))
+        .merge(api::api_router(sessions.clone(), mcp_state))
         .merge(api::simple_chat_route(sessions.clone()));
 
     // Add UI route if enabled
