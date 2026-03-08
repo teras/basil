@@ -6,6 +6,7 @@ mod api;
 mod config;
 mod docker;
 mod error;
+mod init;
 mod mcp;
 mod models;
 mod services;
@@ -20,11 +21,12 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use std::{net::SocketAddr, path::PathBuf, time::Instant};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt};
 
 use config::{get_settings, init_settings, Settings};
+use init::{InitPhase, InitState};
 use services::SessionManager;
 
 #[derive(Parser, Debug)]
@@ -84,31 +86,54 @@ async fn main() {
         None => docker::get_project_port(&project_dir).await,
     };
 
-    // Init project (copy credentials, inject MCP config)
-    if let Err(e) = docker::init_project(&project_dir, port) {
-        tracing::error!("{}", e);
-        std::process::exit(1);
-    }
+    // Create init state (shared between server and background init)
+    let init_state = Arc::new(InitState::new());
 
-    // Start container
-    let container_name = match docker::start_container(&project_dir).await {
-        Ok(name) => name,
-        Err(e) => {
-            tracing::error!("Failed to start container: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Ctrl+C handler - stop container on exit
-    let cn = container_name.clone();
+    // Start server immediately, then init Docker in background
+    let init_state_bg = init_state.clone();
+    let project_dir_bg = project_dir.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        docker::stop_container(&cn).await;
-        std::process::exit(0);
+        run_init(init_state_bg, &project_dir_bg, port).await;
     });
 
-    // Run server
-    run_server(&project_dir, port, !args.no_ui, container_name).await;
+    // Run server (available immediately with init status)
+    run_server(&project_dir, port, !args.no_ui, init_state).await;
+}
+
+/// Background initialization - Docker setup
+async fn run_init(init_state: Arc<InitState>, project_dir: &PathBuf, port: u16) {
+    // Init project (copy credentials, inject MCP config)
+    init_state.set_phase(InitPhase::InitProject).await;
+    let init_err = docker::init_project(project_dir, port).err().map(|e| e.to_string());
+    if let Some(msg) = init_err {
+        tracing::error!("{}", msg);
+        init_state.set_failed(msg).await;
+        return;
+    }
+
+    // Start container (includes base image build if needed)
+    init_state.set_phase(InitPhase::StartingContainer).await;
+    let container_result = docker::start_container(project_dir, Some(init_state.clone())).await
+        .map_err(|e| e.to_string());
+    match container_result {
+        Ok(name) => {
+            // Ctrl+C handler - stop container on exit
+            let cn = name.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                docker::stop_container(&cn).await;
+                std::process::exit(0);
+            });
+
+            init_state.set_ready(name).await;
+            tracing::info!("Initialization complete - system ready");
+        }
+        Err(msg) => {
+            let msg = format!("Failed to start container: {}", msg);
+            tracing::error!("{}", msg);
+            init_state.set_failed(msg).await;
+        }
+    }
 }
 
 /// Custom request logging middleware
@@ -130,7 +155,7 @@ async fn request_logging(
 
     let msg = format!("{ip} {method} {path} → {status} ({latency}ms)");
 
-    if path == "/health" || path == "/api/health" {
+    if path == "/health" || path == "/api/health" || path == "/api/status" {
         tracing::debug!("{msg}");
     } else if status.is_success() {
         tracing::info!("{msg}");
@@ -143,7 +168,7 @@ async fn request_logging(
     response
 }
 
-async fn run_server(project_dir: &PathBuf, port: u16, serve_ui: bool, container_name: String) {
+async fn run_server(project_dir: &PathBuf, port: u16, serve_ui: bool, init_state: Arc<InitState>) {
     let project_name = project_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -159,7 +184,6 @@ async fn run_server(project_dir: &PathBuf, port: u16, serve_ui: bool, container_
         project_path: project_dir.to_string_lossy().to_string(),
         default_working_dir: project_dir.clone(),
         session_dir: docker::get_claude_dir(project_dir).join("sessions"),
-        container_name: container_name.clone(),
     };
 
     init_settings(settings);
@@ -167,12 +191,12 @@ async fn run_server(project_dir: &PathBuf, port: u16, serve_ui: bool, container_
 
     // Create session manager and MCP state
     let sessions = SessionManager::new();
-    let mcp_state = mcp::McpState::new();
+    let mcp_state = mcp::McpState::new(init_state.clone());
 
     // Build router
     let mut app = Router::new()
-        .merge(api::api_router(sessions.clone(), mcp_state))
-        .merge(api::simple_chat_route(sessions.clone()));
+        .merge(api::api_router(sessions.clone(), mcp_state.clone(), init_state.clone()))
+        .merge(api::simple_chat_route(sessions.clone(), init_state, mcp_state));
 
     // Add UI route if enabled
     if settings.serve_ui {

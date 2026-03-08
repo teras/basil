@@ -144,9 +144,9 @@ pub fn routes(sessions: Arc<SessionManager>) -> Router {
     Router::new()
         .route("/session/new", post(create_session))
         .route("/session/list", get(list_sessions))
-        .route("/session/:session_id", get(get_session_info))
-        .route("/session/:session_id", delete(delete_session_handler))
-        .route("/session/:session_id/rename", patch(rename_session))
-        .route("/session/:session_id/mode", patch(set_session_mode))
+        .route("/session/{session_id}", get(get_session_info))
+        .route("/session/{session_id}", delete(delete_session_handler))
+        .route("/session/{session_id}/rename", patch(rename_session))
+        .route("/session/{session_id}/mode", patch(set_session_mode))
         .with_state(sessions)
 }

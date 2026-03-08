@@ -1,3 +1,142 @@
+// ============================================================================
+// Initialization Status Polling
+// ============================================================================
+
+let systemReady; // undefined = unknown, false = explicitly rebuilding, true = ready
+let shownApprovalIds = new Set();
+const RING_CIRCUMFERENCE = 2 * Math.PI * 52; // ~326.73
+
+async function pollInitStatus() {
+    const overlay = document.getElementById('initOverlay');
+    const message = document.getElementById('initMessage');
+    const ring = document.getElementById('initRing');
+    const ringFg = document.getElementById('initRingFg');
+    const pctDisplay = document.getElementById('initPct');
+    const errorDiv = document.getElementById('initError');
+    const logsDiv = document.getElementById('initLogs');
+    const detailsToggle = document.getElementById('initDetailsToggle');
+    let logsVisible = false;
+
+    // First check - if already ready, hide overlay immediately
+    // (skip this check if systemReady was explicitly set to false, e.g. during rebuild)
+    if (systemReady !== false) {
+        try {
+            const resp = await fetch('/api/status', { signal: AbortSignal.timeout(3000) });
+            const data = await resp.json();
+            if (data.ready) {
+                systemReady = true;
+                overlay.classList.add('hidden');
+                overlay.style.display = 'none';
+                return;
+            }
+        } catch (e) {
+            // Server not up yet, continue to polling
+        }
+    }
+
+    // Not ready yet - show overlay
+    overlay.style.display = '';
+    overlay.classList.remove('hidden');
+    ring.style.display = '';
+    ring.classList.add('indeterminate');
+    ringFg.style.strokeDashoffset = RING_CIRCUMFERENCE;
+    pctDisplay.innerHTML = '';
+    errorDiv.style.display = 'none';
+    detailsToggle.style.display = 'none';
+    logsDiv.classList.remove('visible');
+
+    if (!overlay._listenersAttached) {
+        overlay._listenersAttached = true;
+        detailsToggle.addEventListener('click', () => {
+            logsVisible = !logsVisible;
+            logsDiv.classList.toggle('visible', logsVisible);
+            detailsToggle.textContent = logsVisible ? 'Hide details' : 'Show details';
+        });
+    }
+
+    // If we know a rebuild is coming (systemReady was set to false explicitly),
+    // wait for the server to actually start rebuilding before checking for ready
+    if (systemReady === false) {
+        let waitAttempts = 0;
+        while (waitAttempts < 10) {
+            try {
+                const resp = await fetch('/api/status', { signal: AbortSignal.timeout(3000) });
+                const data = await resp.json();
+                if (!data.ready) break; // Server confirmed not ready — proceed to polling
+            } catch (e) { break; }
+            waitAttempts++;
+            await new Promise(r => setTimeout(r, 500));
+        }
+    }
+
+    while (!systemReady) {
+        try {
+            const resp = await fetch('/api/status', { signal: AbortSignal.timeout(3000) });
+            const data = await resp.json();
+
+            if (data.ready) {
+                systemReady = true;
+                ring.classList.remove('indeterminate');
+                ringFg.style.strokeDashoffset = '0';
+                pctDisplay.innerHTML = `100<span class="pct-symbol">%</span>`;
+                await new Promise(r => setTimeout(r, 400));
+                overlay.classList.add('hidden');
+                overlay.style.display = 'none';
+                return;
+            }
+
+            if (data.phase === 'failed') {
+                ring.style.display = 'none';
+                message.textContent = data.message;
+                errorDiv.style.display = 'block';
+                errorDiv.textContent = data.error || 'Initialization failed';
+                if (data.logs && data.logs.length > 0) {
+                    detailsToggle.style.display = '';
+                    logsDiv.classList.add('visible');
+                    detailsToggle.textContent = 'Hide details';
+                    logsVisible = true;
+                    updateLogs(logsDiv, data.logs);
+                }
+                return;
+            }
+
+            message.textContent = data.message;
+
+            // Update progress ring
+            if (data.progress > 0) {
+                ring.classList.remove('indeterminate');
+                const offset = RING_CIRCUMFERENCE * (1 - data.progress / 100);
+                ringFg.style.strokeDashoffset = offset;
+                pctDisplay.innerHTML = `${data.progress}<span class="pct-symbol">%</span>`;
+            }
+
+            // Show details toggle when there are logs
+            if (data.logs && data.logs.length > 0) {
+                detailsToggle.style.display = '';
+                updateLogs(logsDiv, data.logs);
+            }
+        } catch (e) {
+            message.textContent = 'Connecting to server...';
+        }
+
+        await new Promise(r => setTimeout(r, 1000));
+    }
+}
+
+function updateLogs(logsDiv, logs) {
+    const recentLogs = logs.slice(-50);
+    logsDiv.innerHTML = recentLogs.map(l => {
+        const d = document.createElement('div');
+        d.className = 'log-line';
+        d.textContent = l;
+        return d.outerHTML;
+    }).join('');
+    logsDiv.scrollTop = logsDiv.scrollHeight;
+}
+
+// Start init polling immediately
+pollInitStatus();
+
 // Configure marked
 marked.setOptions({
     breaks: true,
@@ -123,6 +262,7 @@ newSessionBtn.addEventListener('click', async () => {
     currentSession = null;
     sessionLabel.textContent = 'New Session';
     clearChat();
+    shownApprovalIds.clear();
     sessionDropdown.classList.remove('open');
     planMode = true;           // Reset to plan mode
     updatePlanModeUI();        // Update UI
@@ -253,6 +393,7 @@ async function selectSession(sessionId) {
     localStorage.setItem('lastSessionId', sessionId);
     sessionDropdown.classList.remove('open');
     clearChat();
+    shownApprovalIds.clear();
 
     // Load session history
     try {
@@ -740,10 +881,20 @@ async function pollResponses(sessionId) {
 
     let more = true;
     while (more) {
-        const resp = await fetch(`/api/chat/next?timeout=30`, {
-            headers: { 'X-Session': sessionId }
-        });
-        const block = await resp.json();
+        let block;
+        try {
+            const resp = await fetch(`/api/chat/next?timeout=30`, {
+                headers: { 'X-Session': sessionId }
+            });
+            block = await resp.json();
+        } catch (err) {
+            // If the system is rebuilding (container restart), exit gracefully
+            if (!systemReady) {
+                typingIndicator.classList.remove('active');
+                return;
+            }
+            throw err;
+        }
 
         if (block.type === 'text' && block.content) {
             if (block.content !== lastText) {
@@ -756,8 +907,6 @@ async function pollResponses(sessionId) {
             const toolName = block.tool || 'tool';
             const toolInput = block.input || {};
             const toolUseId = block.tool_use_id;
-
-            console.log('Tool block received:', { toolName, toolUseId, block });
 
             if (isInteractiveTool(toolName) && toolUseId) {
                 currentToolGroup = null;
@@ -787,8 +936,36 @@ async function pollResponses(sessionId) {
                 addToolChip(currentToolGroup, toolName, toolInput);
                 currentMsg = currentToolGroup;
             }
+        } else if (block.type === 'approval') {
+            currentToolGroup = null;
+            const approvalType = block.approval_type;
+            const approvalId = block.approval_id;
+            if (approvalType === 'mount') {
+                showMountDialog({
+                    id: approvalId,
+                    host_path: block.host_path,
+                    target_path: block.target_path,
+                    readonly: block.readonly,
+                    reason: block.reason,
+                });
+            } else if (approvalType === 'install') {
+                showInstallDialog({
+                    id: approvalId,
+                    dockerfile_commands: block.dockerfile_commands,
+                });
+            }
+            // Stop polling — Claude is blocked waiting for user approval.
+            // The approval flow (approve/reject → rebuild) is handled by
+            // handleApprovalResponse, not by this polling loop.
+            typingIndicator.classList.remove('active');
+            return;
         } else if (block.type === 'error') {
             currentToolGroup = null;
+            // Suppress docker exec errors during container rebuild
+            if (!systemReady && block.content && block.content.includes('Claude error:')) {
+                typingIndicator.classList.remove('active');
+                return;
+            }
             const errMsg = createMessageElement('system');
             errMsg.textContent = block.content;
         }
@@ -797,9 +974,6 @@ async function pollResponses(sessionId) {
     }
 
     typingIndicator.classList.remove('active');
-    isProcessing = false;
-    setButtonMode(false);
-
 }
 
 async function sendMessage() {
@@ -836,13 +1010,15 @@ async function sendMessage() {
 
     } catch (err) {
         typingIndicator.classList.remove('active');
+        // Don't show network errors during container rebuild — the overlay handles feedback
+        if (!systemReady) return;
         const errMsg = createMessageElement('system');
         errMsg.textContent = 'Error: ' + err.message;
+    } finally {
+        isProcessing = false;
+        setButtonMode(false);
+        messageInput.focus();
     }
-
-    isProcessing = false;
-    setButtonMode(false);
-    messageInput.focus();
 }
 
 function setButtonMode(stopMode) {
@@ -943,184 +1119,153 @@ document.getElementById('scrollDownBtn').addEventListener('click', () => {
 });
 
 // ============================================================================
-// Mount Request Management
+// Approval Request Dialogs (received via chat/next stream)
 // ============================================================================
 
-let pendingMountsCount = 0;
-let mountDialogVisible = false;
-
-// Check for pending mounts periodically
-async function checkPendingMounts() {
-    try {
-        const resp = await fetch('/api/mounts');
-        if (!resp.ok) return;
-
-        const data = await resp.json();
-        pendingMountsCount = data.pending_count;
-
-        // Update UI indicator
-        updateMountIndicator();
-
-        // Show dialog if there are pending mounts and dialog not already visible
-        if (pendingMountsCount > 0 && !mountDialogVisible) {
-            showMountDialog(data.mounts.filter(m => !m.approved));
-        }
-    } catch (e) {
-        console.error('Failed to check mounts:', e);
-    }
-}
-
-function updateMountIndicator() {
-    let indicator = document.getElementById('mountIndicator');
-
-    if (pendingMountsCount === 0) {
-        if (indicator) indicator.remove();
-        return;
-    }
-
-    if (!indicator) {
-        indicator = document.createElement('div');
-        indicator.id = 'mountIndicator';
-        indicator.className = 'mount-indicator';
-        indicator.addEventListener('click', async () => {
-            const resp = await fetch('/api/mounts');
-            const data = await resp.json();
-            showMountDialog(data.mounts.filter(m => !m.approved));
-        });
-        document.querySelector('.header-left').appendChild(indicator);
-    }
-
-    indicator.innerHTML = `<span class="mount-icon">📁</span><span class="mount-count">${pendingMountsCount}</span>`;
-    indicator.title = `${pendingMountsCount} pending mount request(s)`;
-}
-
-function showMountDialog(pendingMounts) {
-    if (pendingMounts.length === 0) {
-        hideMountDialog();
-        return;
-    }
-
-    mountDialogVisible = true;
-
-    // Remove existing dialog
-    const existing = document.getElementById('mountDialog');
-    if (existing) existing.remove();
-
+function showMountDialog(mount) {
     const dialog = document.createElement('div');
-    dialog.id = 'mountDialog';
-    dialog.className = 'mount-dialog';
+    dialog.id = `mountDialog-${mount.id}`;
+    dialog.className = 'interactive-container';
+
+    const content = document.createElement('div');
+    content.className = 'interactive-tool mount-request';
 
     const header = document.createElement('div');
-    header.className = 'mount-dialog-header';
-    header.innerHTML = `<span class="mount-dialog-icon">📁</span> Mount Requests`;
-    dialog.appendChild(header);
+    header.className = 'mount-header';
+    header.innerHTML = '📁 Mount Request';
+    content.appendChild(header);
 
     const description = document.createElement('div');
-    description.className = 'mount-dialog-description';
-    description.textContent = 'Claude is requesting access to the following directories:';
-    dialog.appendChild(description);
+    description.className = 'mount-description';
+    description.textContent = 'Claude is requesting access to a directory on your machine:';
+    content.appendChild(description);
 
-    const mountList = document.createElement('div');
-    mountList.className = 'mount-list';
+    const pathsDiv = document.createElement('div');
+    pathsDiv.className = 'mount-paths';
+    pathsDiv.innerHTML = `
+        <div class="mount-path-row">
+            <span class="mount-label">Host path:</span>
+            <code class="mount-value">${escapeHtml(mount.host_path)}</code>
+        </div>
+        <div class="mount-path-row">
+            <span class="mount-label">Container path:</span>
+            <code class="mount-value">${escapeHtml(mount.target_path)}</code>
+        </div>
+        <div class="mount-path-row">
+            <span class="mount-label">Access:</span>
+            <span class="mount-value">${mount.readonly ? 'Read-only' : 'Read-write'}</span>
+        </div>
+    `;
+    content.appendChild(pathsDiv);
 
-    pendingMounts.forEach(mount => {
-        const item = document.createElement('div');
-        item.className = 'mount-item';
-        item.dataset.index = mount.index;
+    if (mount.reason) {
+        const reasonDiv = document.createElement('div');
+        reasonDiv.className = 'mount-reason';
+        reasonDiv.innerHTML = `<strong>Reason:</strong> ${escapeHtml(mount.reason)}`;
+        content.appendChild(reasonDiv);
+    }
 
-        const info = document.createElement('div');
-        info.className = 'mount-info';
-
-        const paths = document.createElement('div');
-        paths.className = 'mount-paths';
-        paths.innerHTML = `<span class="mount-host">${escapeHtml(mount.host)}</span> → <span class="mount-target">${escapeHtml(mount.target)}</span>`;
-        info.appendChild(paths);
-
-        const mode = document.createElement('div');
-        mode.className = 'mount-mode';
-        mode.textContent = mount.readonly ? '(read-only)' : '(read-write)';
-        info.appendChild(mode);
-
-        if (mount.reason) {
-            const reason = document.createElement('div');
-            reason.className = 'mount-reason';
-            reason.textContent = mount.reason;
-            info.appendChild(reason);
-        }
-
-        item.appendChild(info);
-
-        const buttons = document.createElement('div');
-        buttons.className = 'mount-buttons';
-
-        const approveBtn = document.createElement('button');
-        approveBtn.className = 'mount-btn approve';
-        approveBtn.textContent = '✓';
-        approveBtn.title = 'Approve';
-        approveBtn.addEventListener('click', () => handleMountAction(mount.index, true, item));
-
-        const rejectBtn = document.createElement('button');
-        rejectBtn.className = 'mount-btn reject';
-        rejectBtn.textContent = '✗';
-        rejectBtn.title = 'Reject';
-        rejectBtn.addEventListener('click', () => handleMountAction(mount.index, false, item));
-
-        buttons.appendChild(approveBtn);
-        buttons.appendChild(rejectBtn);
-        item.appendChild(buttons);
-
-        mountList.appendChild(item);
-    });
-
-    dialog.appendChild(mountList);
-
-    const footer = document.createElement('div');
-    footer.className = 'mount-dialog-footer';
-    footer.innerHTML = '<small>After approval, use the restart_container tool to apply changes</small>';
-    dialog.appendChild(footer);
-
-    document.body.appendChild(dialog);
+    appendApprovalButtons(content, dialog, '/api/mounts/' + mount.id + '/respond', 'Mount');
+    dialog.appendChild(content);
+    insertApprovalDialog(dialog);
 }
 
-function hideMountDialog() {
-    mountDialogVisible = false;
-    const dialog = document.getElementById('mountDialog');
-    if (dialog) dialog.remove();
+function showInstallDialog(install) {
+    const dialog = document.createElement('div');
+    dialog.id = `installDialog-${install.id}`;
+    dialog.className = 'interactive-container';
+
+    const content = document.createElement('div');
+    content.className = 'interactive-tool mount-request';
+
+    const header = document.createElement('div');
+    header.className = 'mount-header';
+    header.innerHTML = '📦 Install Request';
+    content.appendChild(header);
+
+    const description = document.createElement('div');
+    description.className = 'mount-description';
+    description.textContent = 'Claude wants to add the following Dockerfile commands:';
+    content.appendChild(description);
+
+    const codeDiv = document.createElement('div');
+    codeDiv.className = 'mount-paths';
+    const pre = document.createElement('pre');
+    pre.style.margin = '0';
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.style.wordBreak = 'break-all';
+    const code = document.createElement('code');
+    code.textContent = install.dockerfile_commands;
+    pre.appendChild(code);
+    codeDiv.appendChild(pre);
+    content.appendChild(codeDiv);
+
+    appendApprovalButtons(content, dialog, '/api/installs/' + install.id + '/respond', 'Install');
+    dialog.appendChild(content);
+    insertApprovalDialog(dialog);
 }
 
-async function handleMountAction(index, approve, itemElement) {
-    const endpoint = approve ? 'approve' : 'reject';
+function appendApprovalButtons(content, dialog, endpoint, label) {
+    const buttonsDiv = document.createElement('div');
+    buttonsDiv.className = 'mount-buttons';
 
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'mount-btn approve';
+    approveBtn.textContent = '✓ Approve';
+    approveBtn.addEventListener('click', () => handleApprovalResponse(endpoint, true, dialog, label));
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'mount-btn reject';
+    rejectBtn.textContent = '✗ Reject';
+    rejectBtn.addEventListener('click', () => handleApprovalResponse(endpoint, false, dialog, label));
+
+    buttonsDiv.appendChild(approveBtn);
+    buttonsDiv.appendChild(rejectBtn);
+    content.appendChild(buttonsDiv);
+}
+
+function insertApprovalDialog(dialog) {
+    if (typingIndicator.classList.contains('active')) {
+        chatContainer.insertBefore(dialog, typingIndicator);
+    } else {
+        chatContainer.appendChild(dialog);
+    }
+    scrollToBottom();
+}
+
+async function handleApprovalResponse(endpoint, approved, dialogElement, label) {
     try {
-        itemElement.classList.add('processing');
-
-        const resp = await fetch(`/api/mounts/${index}/${endpoint}`, {
-            method: 'PATCH'
+        const resp = await fetch(endpoint, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approved })
         });
 
         const data = await resp.json();
-
         if (data.ok) {
-            // Remove the item with animation
-            itemElement.classList.add('done');
-            itemElement.classList.add(approve ? 'approved' : 'rejected');
+            const content = dialogElement.querySelector('.interactive-tool');
+            content.classList.add('submitted');
 
-            setTimeout(() => {
-                itemElement.remove();
+            dialogElement.querySelector('.mount-buttons')?.remove();
 
-                // Check if any items left
-                const mountList = document.querySelector('.mount-list');
-                if (mountList && mountList.children.length === 0) {
-                    hideMountDialog();
-                }
+            const status = document.createElement('div');
+            status.className = 'mount-status';
+            status.textContent = approved ? `✓ ${label} approved — rebuilding...` : `✗ ${label} rejected`;
+            status.classList.add(approved ? 'approved' : 'rejected');
+            content.appendChild(status);
 
-                // Refresh mount count
-                checkPendingMounts();
-            }, 300);
+            // On approval, show init overlay for rebuild progress
+            if (approved) {
+                systemReady = false;
+                await pollInitStatus();
+                // System is ready again — show confirmation in chat
+                const sysMsg = createMessageElement('assistant');
+                sysMsg.textContent = 'Container rebuilt successfully. Send a message to continue.';
+                scrollToBottom();
+            }
         }
     } catch (e) {
-        console.error('Mount action failed:', e);
-        itemElement.classList.remove('processing');
+        console.error(`Failed to respond to ${label.toLowerCase()}:`, e);
     }
 }
 
@@ -1130,10 +1275,6 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// Poll for pending mounts every 2 seconds
-setInterval(checkPendingMounts, 2000);
-
 // Initialize
 updatePlanModeUI();  // Set initial button state
 loadLastSession();
-checkPendingMounts();

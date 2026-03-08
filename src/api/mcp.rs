@@ -1,55 +1,61 @@
-//! MCP HTTP endpoint handler and mount management.
+//! MCP HTTP endpoint handler.
 
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use crate::config::get_settings;
-use crate::docker::{self, BasilConfig, MountConfig};
 use crate::mcp::{handle_request, JsonRpcRequest, JsonRpcResponse, McpState};
 
 /// MCP routes
 pub fn routes(state: Arc<McpState>) -> Router {
     Router::new()
         .route("/mcp", post(mcp_handler))
-        .route("/api/mounts", get(list_mounts))
-        .route("/api/mounts/:index/approve", patch(approve_mount))
-        .route("/api/mounts/:index/reject", patch(reject_mount))
+        .route("/api/mounts/{id}/respond", patch(respond_to_mount))
+        .route("/api/installs/{id}/respond", patch(respond_to_install))
         .with_state(state)
 }
 
-/// Handle MCP JSON-RPC requests
+/// Handle MCP JSON-RPC requests (private network only — loopback + Docker bridge)
 async fn mcp_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<McpState>>,
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
+    // Only allow private IPs (loopback for local, Docker bridge for containers)
+    if !is_private_ip(addr.ip()) {
+        return (StatusCode::FORBIDDEN).into_response();
+    }
+
     // Extract session ID from headers (optional for initialize)
     let session_id = headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // For non-initialize requests, validate session
+    // For non-initialize requests, require a valid session
     if request.method != "initialize" {
-        if let Some(ref sid) = session_id {
-            if !state.is_valid_session(sid).await {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(JsonRpcResponse::error(
-                        request.id,
-                        -32000,
-                        "Invalid or expired session",
-                    )),
-                )
-                    .into_response();
-            }
+        let valid = match &session_id {
+            Some(sid) => state.is_valid_session(sid).await,
+            None => false,
+        };
+        if !valid {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(JsonRpcResponse::error(
+                    request.id,
+                    -32000,
+                    "Invalid or missing session",
+                )),
+            )
+                .into_response();
         }
     }
 
@@ -70,126 +76,70 @@ async fn mcp_handler(
 }
 
 // ============================================================================
-// Mount Management Endpoints
+// Approval Endpoints
 // ============================================================================
 
-#[derive(Serialize)]
-struct MountsResponse {
-    mounts: Vec<MountWithIndex>,
-    pending_count: usize,
-}
-
-#[derive(Serialize)]
-struct MountWithIndex {
-    index: usize,
-    host: String,
-    target: String,
-    readonly: bool,
+#[derive(Deserialize)]
+struct ApprovalResponseBody {
     approved: bool,
-    reason: Option<String>,
 }
 
 #[derive(Serialize)]
-struct MountActionResponse {
+struct ApprovalResponseResult {
     ok: bool,
     message: String,
 }
 
-/// List all mounts (pending and approved)
-async fn list_mounts(
-    State(_state): State<Arc<McpState>>,
-) -> Result<Json<MountsResponse>, StatusCode> {
-    let settings = get_settings();
-    let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
-
-    let config = docker::load_basil_config(&claude_dir)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mounts: Vec<MountWithIndex> = config
-        .mounts
-        .iter()
-        .enumerate()
-        .map(|(i, m)| MountWithIndex {
-            index: i,
-            host: m.host.clone(),
-            target: m.target.clone(),
-            readonly: m.readonly,
-            approved: m.approved,
-            reason: m.reason.clone(),
-        })
-        .collect();
-
-    let pending_count = mounts.iter().filter(|m| !m.approved).count();
-
-    Ok(Json(MountsResponse {
-        mounts,
-        pending_count,
-    }))
+/// Respond to a mount request (approve or reject, localhost only)
+async fn respond_to_mount(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<McpState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ApprovalResponseBody>,
+) -> Result<Json<ApprovalResponseResult>, StatusCode> {
+    require_loopback(addr)?;
+    let ok = state.respond_to_mount(&id, body.approved).await;
+    Ok(Json(approval_result(ok, "Mount", body.approved)))
 }
 
-/// Approve a mount request
-async fn approve_mount(
-    State(_state): State<Arc<McpState>>,
-    Path(index): Path<usize>,
-) -> Result<Json<MountActionResponse>, StatusCode> {
-    update_mount_approval(index, true).await
+/// Respond to an install request (approve or reject, localhost only)
+async fn respond_to_install(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<McpState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ApprovalResponseBody>,
+) -> Result<Json<ApprovalResponseResult>, StatusCode> {
+    require_loopback(addr)?;
+    let ok = state.respond_to_install(&id, body.approved).await;
+    Ok(Json(approval_result(ok, "Install", body.approved)))
 }
 
-/// Reject (remove) a mount request
-async fn reject_mount(
-    State(_state): State<Arc<McpState>>,
-    Path(index): Path<usize>,
-) -> Result<Json<MountActionResponse>, StatusCode> {
-    update_mount_approval(index, false).await
+fn require_loopback(addr: SocketAddr) -> Result<(), StatusCode> {
+    if addr.ip().is_loopback() { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
 }
 
-async fn update_mount_approval(
-    index: usize,
-    approve: bool,
-) -> Result<Json<MountActionResponse>, StatusCode> {
-    let settings = get_settings();
-    let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
-    let config_path = claude_dir.join("config.json");
-
-    let mut config = docker::load_basil_config(&claude_dir)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if index >= config.mounts.len() {
-        return Ok(Json(MountActionResponse {
-            ok: false,
-            message: "Mount not found".to_string(),
-        }));
-    }
-
-    if approve {
-        config.mounts[index].approved = true;
-        let mount = &config.mounts[index];
-        let message = format!("Approved: {} → {}", mount.host, mount.target);
-
-        // Save config
-        let content = serde_json::to_string_pretty(&config)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        std::fs::write(&config_path, content)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        Ok(Json(MountActionResponse {
-            ok: true,
-            message,
-        }))
+fn approval_result(ok: bool, label: &str, approved: bool) -> ApprovalResponseResult {
+    let action = if approved { "approved" } else { "rejected" };
+    let message = if ok {
+        format!("{} request {}", label, action)
     } else {
-        // Remove the mount request
-        let mount = config.mounts.remove(index);
-        let message = format!("Rejected: {} → {}", mount.host, mount.target);
+        format!("{} request not found or already {}", label, action)
+    };
+    ApprovalResponseResult { ok, message }
+}
 
-        // Save config
-        let content = serde_json::to_string_pretty(&config)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        std::fs::write(&config_path, content)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        Ok(Json(MountActionResponse {
-            ok: true,
-            message,
-        }))
+/// Check if an IP is private (loopback, link-local, or RFC1918/Docker bridge)
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()       // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local()     // 169.254.0.0/16
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()                                    // ::1
+                || (v6.segments()[0] & 0xfe00) == 0xfc00        // ULA fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80        // link-local fe80::/10
+        }
     }
 }

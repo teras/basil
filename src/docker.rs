@@ -1,5 +1,6 @@
 //! Docker container management - start/stop warm container for Claude CLI execution.
 
+use crate::init::{InitPhase, InitState};
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
@@ -12,9 +13,37 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-const BASE_IMAGE: &str = "claude-code-runner";
-const CONTAINER_PREFIX: &str = "claude";
+const BASE_IMAGE: &str = "basil:latest";
+const CONTAINER_PREFIX: &str = "basil";
+
+const BASE_IMAGE_DOCKERFILE: &str = r#"FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl wget git sudo build-essential cmake pkg-config \
+    python3 python3-pip python3-venv \
+    ripgrep fd-find jq tree htop vim nano \
+    unzip zip tar openssh-client ca-certificates gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV NODE_MAJOR=22
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @anthropic-ai/claude-code
+
+RUN pip3 install --break-system-packages fastapi uvicorn[standard] pydantic-settings
+
+RUN mkdir -p /workspace /home/claude/.claude \
+    && chmod 777 /home/claude /home/claude/.claude
+
+WORKDIR /workspace
+CMD ["bash"]
+"#;
 
 // ============================================================================
 // Basil Config Types
@@ -44,8 +73,19 @@ fn default_true() -> bool {
     true
 }
 
+/// Parse "Step 3/7 : ..." into (3, 7)
+fn parse_step(msg: &str) -> Option<(u32, u32)> {
+    let rest = msg.strip_prefix("Step ")?;
+    let slash = rest.find('/')?;
+    let current: u32 = rest[..slash].trim().parse().ok()?;
+    let after_slash = &rest[slash + 1..];
+    let space = after_slash.find(' ').unwrap_or(after_slash.len());
+    let total: u32 = after_slash[..space].trim().parse().ok()?;
+    Some((current, total))
+}
+
 /// Load Basil configuration from .basil/config.json
-pub fn load_basil_config(claude_dir: &Path) -> Result<BasilConfig, Box<dyn std::error::Error>> {
+pub fn load_basil_config(claude_dir: &Path) -> Result<BasilConfig, Box<dyn std::error::Error + Send + Sync>> {
     let config_path = claude_dir.join("config.json");
     if !config_path.exists() {
         return Ok(BasilConfig::default());
@@ -127,7 +167,7 @@ fn is_writable(path: &Path) -> bool {
 }
 
 /// Initialize project - copy credentials from ~/.claude to .basil/
-pub fn init_project(project_dir: &Path, port: u16) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn init_project(project_dir: &Path, port: u16) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let home = dirs::home_dir().ok_or("Cannot find home directory")?;
     let source_claude = home.join(".claude");
     let source_credentials = source_claude.join(".credentials.json");
@@ -190,7 +230,7 @@ pub fn init_project(project_dir: &Path, port: u16) -> Result<PathBuf, Box<dyn st
 }
 
 /// Create CLAUDE.md with Basil environment context
-fn create_claude_md(claude_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn create_claude_md(claude_dir: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let claude_md_path = claude_dir.join("CLAUDE.md");
 
     // Don't overwrite if it exists (user might have customized)
@@ -211,10 +251,9 @@ You do not have access to the user's home directory, system configs, or paths ou
 
 ## MCP Tools Available
 
-- `request_mount` - Request access to a host directory
-- `install_package` - Install packages (apt/pip) persistently
+- `request_mount` - Request access to a host directory (auto-restarts on approval)
+- `install_package` - Add Dockerfile commands for persistent packages (auto-restarts on approval)
 - `list_mounts` - Show configured mounts
-- `restart_container` - Apply pending changes
 
 ## Path Convention
 
@@ -227,7 +266,7 @@ When the user mentions paths like `~/data` or `/home/user/files`, these are **ho
 }
 
 /// Inject MCP server configuration into .claude.json
-fn inject_mcp_config(claude_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+fn inject_mcp_config(claude_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let claude_json_path = claude_dir.join(".claude.json");
 
     // Load existing config or create new
@@ -297,18 +336,103 @@ fn calculate_path_hash(path: &Path) -> u64 {
     hasher.finish()
 }
 
-/// Get custom image name based on project path hash
+/// Get custom image name based on project name and path hash
 fn get_custom_image_name(project_path: &Path) -> String {
     let hash = calculate_path_hash(project_path);
-    format!("basil-{:x}", hash & 0xFFFFFFFF) // Use lower 32 bits for shorter name
+    let basename = project_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_lowercase();
+    // Docker image names must be lowercase and can contain a-z, 0-9, -, _
+    let safe_name: String = basename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(20) // Limit length
+        .collect();
+    let safe_name = if safe_name.is_empty() { "project".to_string() } else { safe_name };
+    format!("basil:{}-{:x}", safe_name, hash & 0xFFFFFFFF)
 }
 
-/// Build custom image from Dockerfile.extras if it exists
-/// Returns the image name to use (custom or base)
-async fn build_custom_image(
+/// Build a Docker image from a Dockerfile string
+async fn build_image(
+    docker: &Docker,
+    image_name: &str,
+    dockerfile: &str,
+    init_state: Option<&InitState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut tar_builder = tar::Builder::new(Vec::new());
+    let dockerfile_bytes = dockerfile.as_bytes();
+    let mut header = tar::Header::new_gnu();
+    header.set_path("Dockerfile")?;
+    header.set_size(dockerfile_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar_builder.append(&header, dockerfile_bytes)?;
+    let tar_data = tar_builder.into_inner()?;
+
+    let build_options = BuildImageOptions {
+        t: image_name.to_string(),
+        rm: true,
+        forcerm: true,
+        ..Default::default()
+    };
+
+    let mut build_stream = docker.build_image(build_options, None, Some(tar_data.into()));
+
+    while let Some(result) = build_stream.next().await {
+        match result {
+            Ok(output) => {
+                if let Some(stream) = output.stream {
+                    let msg = stream.trim();
+                    if !msg.is_empty() {
+                        tracing::debug!("Build [{}]: {}", image_name, msg);
+                        if let Some(state) = init_state {
+                            state.add_log(msg.to_string()).await;
+                            // Parse "Step X/Y" to calculate progress percentage
+                            if msg.starts_with("Step ") {
+                                if let Some((current, total)) = parse_step(msg) {
+                                    let pct = ((current as f32 / total as f32) * 100.0) as u8;
+                                    state.set_progress(pct);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(error) = output.error {
+                    return Err(format!("Docker build failed for {}: {}", image_name, error).into());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensure the base image exists, building it if needed
+async fn ensure_base_image(docker: &Docker, init_state: Option<&InitState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if docker.inspect_image(BASE_IMAGE).await.is_ok() {
+        tracing::debug!("Base image '{}' already exists", BASE_IMAGE);
+        return Ok(());
+    }
+
+    tracing::info!("Base image '{}' not found, building (this may take a few minutes)...", BASE_IMAGE);
+    if let Some(state) = init_state {
+        state.set_phase(InitPhase::BuildingBaseImage).await;
+    }
+    build_image(docker, BASE_IMAGE, BASE_IMAGE_DOCKERFILE, init_state).await?;
+    tracing::info!("Base image '{}' built successfully", BASE_IMAGE);
+    Ok(())
+}
+
+/// Build project image from Dockerfile.extras if it exists.
+/// Returns project-specific image name if extras exist, otherwise base image.
+async fn build_project_image(
     docker: &Docker,
     project_path: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
+    init_state: Option<&InitState>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let claude_dir = get_claude_dir(project_path);
     let extras_path = claude_dir.join("Dockerfile.extras");
 
@@ -318,65 +442,15 @@ async fn build_custom_image(
     }
 
     let image_name = get_custom_image_name(project_path);
-    tracing::info!(
-        "Building custom image {} from {}",
-        image_name,
-        extras_path.display()
-    );
-
-    // Read Dockerfile.extras content
     let extras_content = std::fs::read_to_string(&extras_path)?;
+    let dockerfile = format!("FROM {}\n{}", BASE_IMAGE, extras_content);
 
-    // Create full Dockerfile with FROM base image
-    let dockerfile_content = format!("FROM {}\n{}", BASE_IMAGE, extras_content);
-
-    // Create tar archive with the Dockerfile
-    let mut tar_builder = tar::Builder::new(Vec::new());
-
-    let dockerfile_bytes = dockerfile_content.as_bytes();
-    let mut header = tar::Header::new_gnu();
-    header.set_path("Dockerfile")?;
-    header.set_size(dockerfile_bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    tar_builder.append(&header, dockerfile_bytes)?;
-
-    let tar_data = tar_builder.into_inner()?;
-
-    // Build the image
-    let build_options = BuildImageOptions {
-        t: image_name.clone(),
-        rm: true,
-        forcerm: true,
-        ..Default::default()
-    };
-
-    let mut build_stream = docker.build_image(build_options, None, Some(tar_data.into()));
-
-    // Process build output
-    while let Some(result) = build_stream.next().await {
-        match result {
-            Ok(output) => {
-                if let Some(stream) = output.stream {
-                    // Log build output (trimmed)
-                    let msg = stream.trim();
-                    if !msg.is_empty() {
-                        tracing::debug!("Build: {}", msg);
-                    }
-                }
-                if let Some(error) = output.error {
-                    tracing::error!("Build error: {}", error);
-                    return Err(format!("Docker build failed: {}", error).into());
-                }
-            }
-            Err(e) => {
-                tracing::error!("Build stream error: {}", e);
-                return Err(e.into());
-            }
-        }
+    tracing::info!("Building project image '{}'...", image_name);
+    if let Some(state) = init_state {
+        state.set_phase(InitPhase::BuildingProjectImage).await;
     }
-
-    tracing::info!("Custom image built successfully: {}", image_name);
+    build_image(docker, &image_name, &dockerfile, init_state).await?;
+    tracing::info!("Project image ready: {}", image_name);
     Ok(image_name)
 }
 
@@ -399,12 +473,13 @@ fn update_gitignore(project_dir: &Path) {
 }
 
 /// Start a warm container (sleep infinity) for executing Claude CLI
-pub async fn start_container(project_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitState>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let docker = Docker::connect_with_local_defaults()?;
     docker.ping().await?;
 
     let container_name = get_container_name(project_dir);
     let claude_dir = get_claude_dir(project_dir);
+    let state_ref = init_state.as_deref();
 
     // Check if already running
     if is_container_running(&docker, &container_name).await {
@@ -412,14 +487,15 @@ pub async fn start_container(project_dir: &Path) -> Result<String, Box<dyn std::
         return Ok(container_name);
     }
 
-    // Build custom image if Dockerfile.extras exists, otherwise use base
-    let image_name = match build_custom_image(&docker, project_dir).await {
-        Ok(name) => name,
-        Err(e) => {
-            tracing::warn!("Failed to build custom image, using base: {}", e);
-            BASE_IMAGE.to_string()
-        }
-    };
+    // Ensure base image exists (auto-build if needed)
+    ensure_base_image(&docker, state_ref).await?;
+
+    // Build project image (basil:project-hash)
+    let image_name = build_project_image(&docker, project_dir, state_ref).await?;
+
+    if let Some(state) = state_ref {
+        state.set_phase(InitPhase::StartingContainer).await;
+    }
 
     // Remove stopped container with same name
     let _ = docker
@@ -448,6 +524,17 @@ pub async fn start_container(project_dir: &Path) -> Result<String, Box<dyn std::
         },
     ];
 
+    // Mount .claude.json separately so Claude CLI finds MCP config at ~/.claude.json
+    let claude_json_file = claude_dir.join(".claude.json");
+    if claude_json_file.exists() {
+        mounts.push(Mount {
+            target: Some("/home/claude/.claude.json".to_string()),
+            source: Some(claude_json_file.to_string_lossy().to_string()),
+            typ: Some(MountTypeEnum::BIND),
+            ..Default::default()
+        });
+    }
+
     // Add approved extra mounts from config
     if let Ok(config) = load_basil_config(&claude_dir) {
         for mount_config in config.mounts.iter().filter(|m| m.approved) {
@@ -470,6 +557,8 @@ pub async fn start_container(project_dir: &Path) -> Result<String, Box<dyn std::
     let host_config = HostConfig {
         mounts: Some(mounts),
         auto_remove: Some(true),
+        // Enable host.docker.internal for MCP communication back to Basil
+        extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
         ..Default::default()
     };
 

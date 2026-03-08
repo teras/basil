@@ -1,6 +1,7 @@
 //! Claude CLI runner with streaming JSON parsing via docker exec.
 
 use crate::config::get_settings;
+use crate::init::InitState;
 use crate::models::ResponseBlock;
 use crate::services::SessionManager;
 use std::process::Stdio;
@@ -32,15 +33,13 @@ When the user mentions a path (e.g., "~/data", "/home/user/datasets"), they mean
 
 To access paths outside /workspace:
 1. Use the request_mount MCP tool to request access
-2. Wait for user approval
-3. Use restart_container to apply the mount
-4. The path will then be available inside your container
+2. Wait for user approval — the container auto-restarts to apply changes
+3. The path will then be available inside your container
 
 ## Available Basil MCP tools:
-- request_mount: Request access to a host directory
-- install_package: Install apt/pip packages persistently
+- request_mount: Request access to a host directory (auto-restarts on approval)
+- install_package: Add Dockerfile commands for persistent packages (auto-restarts on approval)
 - list_mounts: Show approved mounts
-- restart_container: Apply pending mounts/packages
 
 ## Best practices:
 - If you need a tool that's not available, use install_package
@@ -55,6 +54,7 @@ pub async fn run_claude(
     session_id: String,
     message: String,
     plan_mode: bool,
+    init_state: Arc<InitState>,
 ) {
     let sender = match sessions.get_sender(&session_id).await {
         Some(s) => s,
@@ -64,8 +64,17 @@ pub async fn run_claude(
         }
     };
 
+    // Container name must exist — callers check is_ready() before spawning us.
+    // Fall back to computing it from settings if init_state hasn't stored it yet.
+    let container_name = match init_state.get_container_name().await {
+        Some(name) => name,
+        None => {
+            let settings = get_settings();
+            crate::docker::get_container_name(&settings.default_working_dir)
+        }
+    };
+
     let settings = get_settings();
-    let container_name = &settings.container_name;
 
     // Get working dir and map host path to container path
     let host_working_dir = sessions
@@ -105,6 +114,11 @@ pub async fn run_claude(
 
     if plan_mode {
         claude_args.extend(["--permission-mode".to_string(), "plan".to_string()]);
+        // Allow Basil MCP tools in plan mode — they have their own approval flow via the UI
+        claude_args.extend([
+            "--allowedTools".to_string(),
+            "mcp__basil__install_package,mcp__basil__request_mount,mcp__basil__list_mounts".to_string(),
+        ]);
     } else {
         claude_args.push("--dangerously-skip-permissions".to_string());
     }
@@ -119,7 +133,7 @@ pub async fn run_claude(
         .arg("-i")
         .arg("-w")
         .arg(&working_dir)
-        .arg(container_name)
+        .arg(&container_name)
         .arg("claude")
         .args(&claude_args)
         .stdin(Stdio::piped())
@@ -137,14 +151,20 @@ pub async fn run_claude(
         sessions.clone(),
         session_id.clone(),
         &mut cancel_rx,
+        init_state.clone(),
     )
     .await;
 
     if let Err(e) = result {
-        let block_id = sessions.next_block_id(&session_id).await;
-        let _ = sender
-            .send(ResponseBlock::error(block_id, format!("Error: {}", e)))
-            .await;
+        // Don't send errors during container rebuild — the init overlay handles it
+        if init_state.is_ready() {
+            let block_id = sessions.next_block_id(&session_id).await;
+            let _ = sender
+                .send(ResponseBlock::error(block_id, format!("Error: {}", e)))
+                .await;
+        } else {
+            tracing::debug!("Claude process error during rebuild: {}", e);
+        }
     }
 
     sessions.set_processing(&session_id, false).await;
@@ -158,6 +178,7 @@ async fn run_process(
     sessions: Arc<SessionManager>,
     session_id: String,
     cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    init_state: Arc<InitState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut child = cmd.spawn()?;
 
@@ -301,18 +322,39 @@ async fn run_process(
         }
     }
 
-    // Wait for process and check stderr
-    let output = child.wait_with_output().await?;
-    if !output.status.success() && !output.stderr.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let block_id = sessions.next_block_id(&session_id).await;
-        sender
-            .send(ResponseBlock::error(
-                block_id,
-                format!("Claude error: {}", &stderr[..stderr.len().min(500)]),
-            ))
-            .await
-            .ok();
+    // Wait for process with timeout (container restart can kill it)
+    let wait_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        child.wait_with_output(),
+    ).await;
+
+    match wait_result {
+        Ok(Ok(output)) if !output.status.success() && !output.stderr.is_empty() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Don't report errors during container rebuild — the init overlay handles it
+            if !init_state.is_ready() {
+                tracing::debug!("Claude process exited during container rebuild");
+            } else {
+                let block_id = sessions.next_block_id(&session_id).await;
+                sender
+                    .send(ResponseBlock::error(
+                        block_id,
+                        format!("Claude error: {}", &stderr[..stderr.len().min(500)]),
+                    ))
+                    .await
+                    .ok();
+            }
+        }
+        Ok(Err(e)) => {
+            if init_state.is_ready() {
+                let block_id = sessions.next_block_id(&session_id).await;
+                sender.send(ResponseBlock::error(block_id, format!("Process error: {}", e))).await.ok();
+            }
+        }
+        Err(_) => {
+            tracing::warn!("Timed out waiting for Claude process to exit");
+        }
+        _ => {}
     }
 
     Ok(())

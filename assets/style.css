@@ -917,201 +917,280 @@ body {
    Mount Request UI
    ============================================================================ */
 
-.mount-indicator {
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-    padding: 0.4rem 0.6rem;
-    background: rgba(251, 191, 36, 0.2);
-    border: 1px solid rgba(251, 191, 36, 0.5);
-    border-radius: 0.5rem;
-    cursor: pointer;
-    transition: all 0.2s;
-    animation: pulse-mount 2s infinite;
-}
-
-@keyframes pulse-mount {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.4); }
-    50% { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0); }
-}
-
-.mount-indicator:hover {
-    background: rgba(251, 191, 36, 0.3);
-    transform: scale(1.05);
-}
-
-.mount-icon {
-    font-size: 0.9rem;
-}
-
-.mount-count {
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: #fbbf24;
-}
-
-.mount-dialog {
-    position: fixed;
-    top: 80px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: linear-gradient(145deg, #1e293b 0%, #0f172a 100%);
-    border: 1px solid rgba(251, 191, 36, 0.3);
+.mount-request {
+    background: rgba(30, 41, 59, 0.95);
+    border: 1px solid rgba(251, 191, 36, 0.4);
     border-radius: 1rem;
     padding: 1.25rem;
-    min-width: 400px;
-    max-width: 90vw;
-    max-height: 80vh;
-    overflow-y: auto;
-    z-index: 1000;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
-    animation: slideIn 0.2s ease-out;
+    color: #e2e8f0;
 }
 
-@keyframes slideIn {
-    from {
-        opacity: 0;
-        transform: translateX(-50%) translateY(-10px);
-    }
-    to {
-        opacity: 1;
-        transform: translateX(-50%) translateY(0);
-    }
-}
-
-.mount-dialog-header {
+.mount-request .mount-header {
     font-size: 1.1rem;
     font-weight: 600;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.75rem;
     color: #fbbf24;
 }
 
-.mount-dialog-icon {
-    margin-right: 0.5rem;
-}
-
-.mount-dialog-description {
-    font-size: 0.85rem;
-    color: rgba(226, 232, 240, 0.7);
+.mount-request .mount-description {
+    font-size: 0.9rem;
+    color: rgba(226, 232, 240, 0.8);
     margin-bottom: 1rem;
 }
 
-.mount-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-}
-
-.mount-item {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0.75rem;
+.mount-request .mount-paths {
     background: rgba(0, 0, 0, 0.2);
-    border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 0.5rem;
-    transition: all 0.3s;
+    padding: 0.75rem;
+    margin-bottom: 1rem;
 }
 
-.mount-item.processing {
-    opacity: 0.6;
-    pointer-events: none;
+.mount-request .mount-path-row {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 0.5rem;
+    align-items: baseline;
 }
 
-.mount-item.done {
-    transform: translateX(100px);
-    opacity: 0;
+.mount-request .mount-path-row:last-child {
+    margin-bottom: 0;
 }
 
-.mount-item.approved {
-    border-color: rgba(74, 222, 128, 0.5);
-    background: rgba(74, 222, 128, 0.1);
+.mount-request .mount-label {
+    color: rgba(226, 232, 240, 0.6);
+    font-size: 0.85rem;
+    min-width: 100px;
 }
 
-.mount-item.rejected {
-    border-color: rgba(239, 68, 68, 0.5);
-    background: rgba(239, 68, 68, 0.1);
-}
-
-.mount-info {
-    flex: 1;
-    min-width: 0;
-}
-
-.mount-paths {
+.mount-request .mount-value {
+    color: #60a5fa;
     font-family: 'Monaco', 'Consolas', monospace;
     font-size: 0.85rem;
     word-break: break-all;
 }
 
-.mount-host {
-    color: #60a5fa;
+.mount-request .mount-reason {
+    font-size: 0.9rem;
+    color: rgba(226, 232, 240, 0.8);
+    margin-bottom: 1rem;
+    padding: 0.75rem;
+    background: rgba(251, 191, 36, 0.1);
+    border-left: 3px solid #fbbf24;
+    border-radius: 0 0.25rem 0.25rem 0;
 }
 
-.mount-target {
-    color: #4ade80;
-}
-
-.mount-mode {
-    font-size: 0.75rem;
-    color: rgba(226, 232, 240, 0.5);
-    margin-top: 0.25rem;
-}
-
-.mount-reason {
-    font-size: 0.8rem;
-    color: rgba(226, 232, 240, 0.7);
-    margin-top: 0.5rem;
-    padding: 0.5rem;
-    background: rgba(0, 0, 0, 0.2);
-    border-radius: 0.25rem;
-    font-style: italic;
-}
-
-.mount-buttons {
+.mount-request .mount-buttons {
     display: flex;
-    gap: 0.5rem;
-    flex-shrink: 0;
+    gap: 0.75rem;
 }
 
-.mount-btn {
-    width: 32px;
-    height: 32px;
+.mount-request .mount-btn {
+    flex: 1;
+    padding: 0.75rem 1rem;
     border: none;
     border-radius: 0.5rem;
+    font-size: 0.9rem;
+    font-weight: 600;
     cursor: pointer;
-    font-size: 1rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     transition: all 0.2s;
 }
 
-.mount-btn.approve {
-    background: rgba(74, 222, 128, 0.2);
-    color: #4ade80;
+.mount-request .mount-btn.approve {
+    background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);
+    color: white;
 }
 
-.mount-btn.approve:hover {
-    background: rgba(74, 222, 128, 0.4);
-    transform: scale(1.1);
+.mount-request .mount-btn.approve:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 15px rgba(34, 197, 94, 0.4);
 }
 
-.mount-btn.reject {
+.mount-request .mount-btn.reject {
     background: rgba(239, 68, 68, 0.2);
+    border: 1px solid rgba(239, 68, 68, 0.5);
     color: #ef4444;
 }
 
-.mount-btn.reject:hover {
-    background: rgba(239, 68, 68, 0.4);
-    transform: scale(1.1);
+.mount-request .mount-btn.reject:hover {
+    background: rgba(239, 68, 68, 0.3);
 }
 
-.mount-dialog-footer {
+.mount-request .mount-status {
     margin-top: 1rem;
-    padding-top: 0.75rem;
-    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 0.75rem;
+    border-radius: 0.5rem;
     text-align: center;
-    color: rgba(226, 232, 240, 0.5);
+    font-weight: 500;
 }
+
+.mount-request .mount-status.approved {
+    background: rgba(74, 222, 128, 0.1);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    color: #4ade80;
+}
+
+.mount-request .mount-status.rejected {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+}
+
+.mount-request.submitted {
+    pointer-events: none;
+}
+
+/* ============================================================================
+   Initialization Overlay
+   ============================================================================ */
+
+.init-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.5s ease;
+}
+
+.init-overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.init-content {
+    text-align: center;
+    max-width: 500px;
+    width: 90%;
+}
+
+.init-title {
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: white;
+    margin-bottom: 2rem;
+}
+
+.init-message {
+    font-size: 1.05rem;
+    color: rgba(255, 255, 255, 0.8);
+    margin-top: 1.5rem;
+    min-height: 1.5em;
+}
+
+/* Progress ring */
+.init-progress-ring {
+    position: relative;
+    width: 120px;
+    height: 120px;
+    margin: 0 auto;
+}
+
+.init-progress-ring svg {
+    transform: rotate(-90deg);
+    width: 120px;
+    height: 120px;
+}
+
+.init-progress-ring .ring-bg {
+    fill: none;
+    stroke: rgba(102, 126, 234, 0.15);
+    stroke-width: 6;
+}
+
+.init-progress-ring .ring-fg {
+    fill: none;
+    stroke: #667eea;
+    stroke-width: 6;
+    stroke-linecap: round;
+    stroke-dasharray: 326.73;
+    stroke-dashoffset: 326.73;
+    transition: stroke-dashoffset 0.4s ease;
+}
+
+.init-progress-pct {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: white;
+}
+
+.init-progress-pct .pct-symbol {
+    font-size: 0.9rem;
+    opacity: 0.6;
+    margin-left: 1px;
+}
+
+/* Indeterminate animation when progress is 0 */
+.init-progress-ring.indeterminate svg {
+    animation: ring-spin 1.4s linear infinite;
+}
+
+.init-progress-ring.indeterminate .ring-fg {
+    stroke-dasharray: 80 246.73;
+    stroke-dashoffset: 0;
+}
+
+@keyframes ring-spin {
+    from { transform: rotate(-90deg); }
+    to { transform: rotate(270deg); }
+}
+
+/* Details toggle */
+.init-details-toggle {
+    background: none;
+    border: none;
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 0.8rem;
+    cursor: pointer;
+    margin-top: 1.5rem;
+    padding: 0.4rem 0.8rem;
+    transition: color 0.2s;
+}
+
+.init-details-toggle:hover {
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.init-logs {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0.5rem;
+    padding: 1rem;
+    max-height: 200px;
+    overflow-y: auto;
+    text-align: left;
+    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.5);
+    line-height: 1.6;
+    margin-top: 0.75rem;
+    display: none;
+}
+
+.init-logs.visible {
+    display: block;
+}
+
+.init-logs .log-line {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.init-error {
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 0.5rem;
+    padding: 1rem;
+    margin-top: 1.5rem;
+    font-size: 0.9rem;
+}
+

@@ -11,6 +11,24 @@
     <script src="/assets/vendor/highlight.min.js"></script>
 </head>
 <body>
+    <!-- Initialization overlay -->
+    <div class="init-overlay" id="initOverlay" style="display:none">
+        <div class="init-content">
+            <div class="init-title">Basil 🌿</div>
+            <div class="init-progress-ring indeterminate" id="initRing">
+                <svg viewBox="0 0 120 120">
+                    <circle class="ring-bg" cx="60" cy="60" r="52"/>
+                    <circle class="ring-fg" id="initRingFg" cx="60" cy="60" r="52"/>
+                </svg>
+                <div class="init-progress-pct" id="initPct"></div>
+            </div>
+            <div class="init-message" id="initMessage">Connecting...</div>
+            <div class="init-error" id="initError" style="display:none"></div>
+            <button class="init-details-toggle" id="initDetailsToggle" style="display:none">Show details</button>
+            <div class="init-logs" id="initLogs"></div>
+        </div>
+    </div>
+
     <div class="header">
         <div class="header-left">
             <div class="status-circle" id="connectionStatus" title="Connecting..."></div>

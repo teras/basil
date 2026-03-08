@@ -2,45 +2,173 @@
 //!
 //! Provides JSON-RPC 2.0 over HTTP for Claude to interact with Basil.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::config::get_settings;
-use crate::docker::{self, BasilConfig, MountConfig};
+use crate::docker::{self, MountConfig};
 
 /// MCP protocol version
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// MCP session state
-#[derive(Default)]
-pub struct McpState {
-    sessions: RwLock<HashMap<String, McpSession>>,
+/// Pending mount request waiting for user approval
+pub struct PendingMountRequest {
+    pub id: String,
+    pub host_path: String,
+    pub target_path: String,
+    pub readonly: bool,
+    pub reason: String,
+    /// Sends `true` for approved, `false` for rejected
+    pub response_tx: oneshot::Sender<bool>,
 }
 
-#[derive(Clone)]
-struct McpSession {
-    initialized: bool,
+/// Pending install request waiting for user approval
+pub struct PendingInstallRequest {
+    pub id: String,
+    pub dockerfile_commands: String,
+    pub response_tx: oneshot::Sender<bool>,
+}
+
+/// MCP session state
+pub struct McpState {
+    sessions: RwLock<HashSet<String>>,
+    pending_mounts: RwLock<HashMap<String, PendingMountRequest>>,
+    pending_installs: RwLock<HashMap<String, PendingInstallRequest>>,
+    /// Serializes config.json reads and writes to prevent race conditions
+    config_lock: Mutex<()>,
+    /// Init state for tracking rebuild progress
+    init_state: Arc<crate::init::InitState>,
+    /// Tracks which approval IDs have been sent to the UI via chat/next
+    sent_approval_ids: RwLock<HashSet<String>>,
+    /// Notifies when new approvals are added
+    approval_notify: tokio::sync::Notify,
+    /// Serializes container restarts to prevent concurrent stop/start races
+    restart_lock: Mutex<()>,
 }
 
 impl McpState {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new(init_state: Arc<crate::init::InitState>) -> Arc<Self> {
+        Arc::new(Self {
+            sessions: RwLock::new(HashSet::new()),
+            pending_mounts: RwLock::new(HashMap::new()),
+            pending_installs: RwLock::new(HashMap::new()),
+            config_lock: Mutex::new(()),
+            init_state,
+            sent_approval_ids: RwLock::new(HashSet::new()),
+            approval_notify: tokio::sync::Notify::new(),
+            restart_lock: Mutex::new(()),
+        })
     }
 
     pub async fn create_session(&self) -> String {
         let session_id = uuid::Uuid::new_v4().to_string();
-        self.sessions.write().await.insert(
-            session_id.clone(),
-            McpSession { initialized: true },
-        );
+        self.sessions.write().await.insert(session_id.clone());
         session_id
     }
 
     pub async fn is_valid_session(&self, session_id: &str) -> bool {
-        self.sessions.read().await.contains_key(session_id)
+        self.sessions.read().await.contains(session_id)
+    }
+
+    /// Add a pending mount request
+    pub async fn add_pending_mount(&self, request: PendingMountRequest) {
+        self.pending_mounts.write().await.insert(request.id.clone(), request);
+        self.approval_notify.notify_waiters();
+    }
+
+    /// Respond to a pending mount request
+    pub async fn respond_to_mount(&self, request_id: &str, approved: bool) -> bool {
+        if let Some(request) = self.pending_mounts.write().await.remove(request_id) {
+            let _ = request.response_tx.send(approved);
+            self.clear_sent_approval(request_id).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a pending mount request (e.g. on timeout)
+    pub async fn remove_pending_mount(&self, request_id: &str) {
+        self.pending_mounts.write().await.remove(request_id);
+    }
+
+    /// Add a pending install request
+    pub async fn add_pending_install(&self, request: PendingInstallRequest) {
+        self.pending_installs.write().await.insert(request.id.clone(), request);
+        self.approval_notify.notify_waiters();
+    }
+
+    /// Respond to a pending install request
+    pub async fn respond_to_install(&self, request_id: &str, approved: bool) -> bool {
+        if let Some(request) = self.pending_installs.write().await.remove(request_id) {
+            let _ = request.response_tx.send(approved);
+            self.clear_sent_approval(request_id).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a pending install request (e.g. on timeout)
+    pub async fn remove_pending_install(&self, request_id: &str) {
+        self.pending_installs.write().await.remove(request_id);
+    }
+
+    /// Get pending approvals that haven't been sent to the UI yet.
+    /// Returns ResponseBlocks for unsent approvals and marks them as sent.
+    pub async fn get_unsent_approvals(&self) -> Vec<crate::models::ResponseBlock> {
+        let mut blocks = Vec::new();
+        let mut sent = self.sent_approval_ids.write().await;
+
+        for (id, req) in self.pending_mounts.read().await.iter() {
+            if sent.insert(id.clone()) {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("approval_type".to_string(), serde_json::json!("mount"));
+                metadata.insert("approval_id".to_string(), serde_json::json!(id));
+                metadata.insert("host_path".to_string(), serde_json::json!(req.host_path));
+                metadata.insert("target_path".to_string(), serde_json::json!(req.target_path));
+                metadata.insert("readonly".to_string(), serde_json::json!(req.readonly));
+                metadata.insert("reason".to_string(), serde_json::json!(req.reason));
+                blocks.push(crate::models::ResponseBlock {
+                    block_id: 0,
+                    content: String::new(),
+                    block_type: "approval".to_string(),
+                    more: false,
+                    metadata,
+                });
+            }
+        }
+
+        for (id, req) in self.pending_installs.read().await.iter() {
+            if sent.insert(id.clone()) {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("approval_type".to_string(), serde_json::json!("install"));
+                metadata.insert("approval_id".to_string(), serde_json::json!(id));
+                metadata.insert("dockerfile_commands".to_string(), serde_json::json!(req.dockerfile_commands));
+                blocks.push(crate::models::ResponseBlock {
+                    block_id: 0,
+                    content: String::new(),
+                    block_type: "approval".to_string(),
+                    more: false,
+                    metadata,
+                });
+            }
+        }
+
+        blocks
+    }
+
+    /// Clean up sent tracking when an approval is responded to
+    async fn clear_sent_approval(&self, request_id: &str) {
+        self.sent_approval_ids.write().await.remove(request_id);
+    }
+
+    /// Get a reference to the approval notify
+    pub fn approval_notifier(&self) -> &tokio::sync::Notify {
+        &self.approval_notify
     }
 }
 
@@ -50,6 +178,7 @@ impl McpState {
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
+    #[allow(dead_code)]
     pub jsonrpc: String,
     pub id: Option<Value>,
     pub method: String,
@@ -101,10 +230,7 @@ impl JsonRpcResponse {
 }
 
 // JSON-RPC error codes
-const PARSE_ERROR: i32 = -32700;
-const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
-const INVALID_PARAMS: i32 = -32602;
 
 // ============================================================================
 // Tool Definitions
@@ -114,7 +240,7 @@ fn get_tool_definitions() -> Value {
     json!([
         {
             "name": "request_mount",
-            "description": "Request access to a directory on the USER'S MACHINE (host). You cannot access paths outside /workspace directly - use this tool first. The 'path' parameter is the path on the user's machine (e.g., /home/user/data, ~/datasets). After user approval and container restart, the directory will be accessible inside your environment.",
+            "description": "Request access to a directory on the USER'S MACHINE (host). You cannot access paths outside /workspace directly - use this tool first. The 'path' parameter is the path on the user's machine (e.g., /home/user/data, ~/datasets). After user approval, the container auto-restarts and the directory becomes accessible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -140,34 +266,21 @@ fn get_tool_definitions() -> Value {
         },
         {
             "name": "install_package",
-            "description": "Install system packages (apt) or Python packages (pip) PERSISTENTLY. Unlike running apt-get directly, packages installed via this tool survive container restarts. Use this when you need tools that aren't available in the base container.",
+            "description": "Add Dockerfile commands for persistent package installation. Commands are appended to Dockerfile.extras and applied automatically after user approval (container auto-restarts). Use standard Dockerfile syntax (RUN, ENV, COPY, etc.). Works for ANY package manager: apt, pip, cargo, npm, rustup, or custom install scripts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "apt": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "System packages to install via apt-get (e.g., ['htop', 'jq', 'ffmpeg'])"
-                    },
-                    "pip": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Python packages to install via pip (e.g., ['pandas', 'numpy', 'requests'])"
+                    "dockerfile_commands": {
+                        "type": "string",
+                        "description": "Raw Dockerfile commands to append. Example: 'RUN apt-get update && apt-get install -y htop' or 'RUN curl -sSf https://sh.rustup.rs | sh -s -- -y\\nENV PATH=/root/.cargo/bin:$PATH'"
                     }
-                }
+                },
+                "required": ["dockerfile_commands"]
             }
         },
         {
             "name": "list_mounts",
             "description": "Show all configured mounts for this project. Displays both approved (active) and pending (awaiting user approval) mounts.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "restart_container",
-            "description": "Restart the container to apply pending changes. Call this AFTER: 1) User approves a mount request, or 2) You add packages via install_package. The container will restart with new mounts and packages available.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false
@@ -184,14 +297,14 @@ fn get_tool_definitions() -> Value {
 pub async fn handle_request(
     state: Arc<McpState>,
     request: JsonRpcRequest,
-    session_id: Option<String>,
+    _session_id: Option<String>,
 ) -> (JsonRpcResponse, Option<String>) {
     let id = request.id.clone();
 
     match request.method.as_str() {
         "initialize" => handle_initialize(state, id).await,
         "tools/list" => (handle_tools_list(id), None),
-        "tools/call" => (handle_tools_call(id, request.params).await, None),
+        "tools/call" => (handle_tools_call(state, id, request.params).await, None),
         _ => (
             JsonRpcResponse::error(id, METHOD_NOT_FOUND, &format!("Unknown method: {}", request.method)),
             None,
@@ -226,15 +339,14 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse::success(id, result)
 }
 
-async fn handle_tools_call(id: Option<Value>, params: Value) -> JsonRpcResponse {
+async fn handle_tools_call(state: Arc<McpState>, id: Option<Value>, params: Value) -> JsonRpcResponse {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let result = match name {
-        "request_mount" => call_request_mount(arguments).await,
-        "install_package" => call_install_package(arguments).await,
+        "request_mount" => call_request_mount(state.clone(), arguments).await,
+        "install_package" => call_install_package(state.clone(), arguments).await,
         "list_mounts" => call_list_mounts().await,
-        "restart_container" => call_restart_container().await,
         _ => Err(format!("Unknown tool: {}", name)),
     };
 
@@ -268,130 +380,203 @@ struct MountRequest {
     reason: String,
 }
 
-async fn call_request_mount(args: Value) -> Result<String, String> {
+async fn call_request_mount(state: Arc<McpState>, args: Value) -> Result<String, String> {
     let req: MountRequest = serde_json::from_value(args)
         .map_err(|e| format!("Invalid arguments: {}", e))?;
 
     let settings = get_settings();
     let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
-    let config_path = claude_dir.join("config.json");
 
-    // Load existing config or create new
-    let mut config: BasilConfig = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        BasilConfig::default()
-    };
+    let target = req.target.clone().unwrap_or_else(|| {
+        let basename = std::path::Path::new(&req.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("mount");
+        format!("/mnt/{}", basename)
+    });
+    let readonly = req.readonly.unwrap_or(true);
 
-    // Check if already mounted
-    if config.mounts.iter().any(|m| m.host == req.path && m.approved) {
-        return Ok(format!("Mount already approved: {} → {}", req.path,
-            req.target.as_deref().unwrap_or(&req.path)));
+    // Quick check if already mounted (the write path has its own lock + double-check)
+    {
+        let claude_dir2 = claude_dir.clone();
+        let path = req.path.clone();
+        let config = tokio::task::spawn_blocking(move || {
+            docker::load_basil_config(&claude_dir2)
+                .map_err(|e| format!("Failed to load config: {}", e))
+        }).await.map_err(|e| format!("Task join error: {}", e))??;
+        if config.mounts.iter().any(|m| m.host == path && m.approved) {
+            return Ok(format!("Mount already approved: {} → {}", req.path, target));
+        }
     }
 
-    // Add pending mount request
-    let target = req.target.unwrap_or_else(|| req.path.clone());
-    let mount = MountConfig {
-        host: req.path.clone(),
-        target: target.clone(),
-        readonly: req.readonly.unwrap_or(true),
-        approved: false,
-        reason: Some(req.reason.clone()),
+    // Create oneshot channel for response
+    let (tx, rx) = oneshot::channel();
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Add pending request
+    let pending = PendingMountRequest {
+        id: request_id.clone(),
+        host_path: req.path.clone(),
+        target_path: target.clone(),
+        readonly,
+        reason: req.reason.clone(),
+        response_tx: tx,
     };
+    state.add_pending_mount(pending).await;
 
-    // Check if already pending
-    if !config.mounts.iter().any(|m| m.host == req.path) {
-        config.mounts.push(mount);
+    tracing::info!("Mount request pending approval: {} → {}", req.path, target);
 
-        // Save config
-        let content = serde_json::to_string_pretty(&config)
-            .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        std::fs::write(&config_path, content)
-            .map_err(|e| format!("Failed to write config: {}", e))?;
+    // Wait for user response (with timeout)
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        rx
+    ).await;
+
+    match response {
+        Ok(Ok(approved)) => {
+            if approved {
+                // Hold lock to prevent concurrent config writes
+                let _lock = state.config_lock.lock().await;
+
+                let mount_host = req.path.clone();
+                let mount_target = target.clone();
+                let mount_reason = req.reason.clone();
+                let claude_dir_inner = claude_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut config = docker::load_basil_config(&claude_dir_inner)
+                        .map_err(|e| format!("Failed to load config: {}", e))?;
+
+                    if !config.mounts.iter().any(|m| m.host == mount_host && m.approved) {
+                        config.mounts.push(MountConfig {
+                            host: mount_host,
+                            target: mount_target,
+                            readonly,
+                            approved: true,
+                            reason: Some(mount_reason),
+                        });
+
+                        let config_path = claude_dir_inner.join("config.json");
+                        let content = serde_json::to_string_pretty(&config)
+                            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+                        std::fs::write(&config_path, content)
+                            .map_err(|e| format!("Failed to write config: {}", e))?;
+                    }
+                    Ok::<(), String>(())
+                }).await.map_err(|e| format!("Task join error: {}", e))??;
+
+                tracing::info!("Auto-restarting container to apply mount...");
+                spawn_restart(&state);
+                Ok(format!(
+                    "✓ Mount approved: {} → {} ({}). Container is restarting...",
+                    req.path, target,
+                    if readonly { "read-only" } else { "read-write" },
+                ))
+            } else {
+                Err(format!("✗ Mount request rejected by user: {} → {}", req.path, target))
+            }
+        }
+        Ok(Err(_)) => {
+            Err("Mount request was cancelled".to_string())
+        }
+        Err(_) => {
+            // Timeout - clean up pending request (no-op if already responded)
+            state.remove_pending_mount(&request_id).await;
+            Err("Mount request timed out (5 minutes). Please try again.".to_string())
+        }
     }
-
-    Ok(format!(
-        "Mount request submitted for approval:\n  {} → {} ({})\n  Reason: {}\n\nThe user will be prompted to approve this request in the Basil UI.",
-        req.path,
-        target,
-        if req.readonly.unwrap_or(true) { "read-only" } else { "read-write" },
-        req.reason
-    ))
 }
 
 #[derive(Debug, Deserialize)]
 struct InstallPackageRequest {
-    apt: Option<Vec<String>>,
-    pip: Option<Vec<String>>,
+    dockerfile_commands: String,
 }
 
-async fn call_install_package(args: Value) -> Result<String, String> {
+async fn call_install_package(state: Arc<McpState>, args: Value) -> Result<String, String> {
     let req: InstallPackageRequest = serde_json::from_value(args)
         .map_err(|e| format!("Invalid arguments: {}", e))?;
 
-    if req.apt.is_none() && req.pip.is_none() {
-        return Err("No packages specified. Use 'apt' and/or 'pip' arrays.".to_string());
+    if req.dockerfile_commands.trim().is_empty() {
+        return Err("No dockerfile_commands provided.".to_string());
     }
 
-    let settings = get_settings();
-    let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
-    let extras_path = claude_dir.join("Dockerfile.extras");
+    // Create oneshot channel for approval
+    let (tx, rx) = oneshot::channel();
+    let request_id = uuid::Uuid::new_v4().to_string();
 
-    // Read existing content or start fresh
-    let mut content = if extras_path.exists() {
-        std::fs::read_to_string(&extras_path)
-            .map_err(|e| format!("Failed to read Dockerfile.extras: {}", e))?
-    } else {
-        String::new()
+    let pending = PendingInstallRequest {
+        id: request_id.clone(),
+        dockerfile_commands: req.dockerfile_commands.clone(),
+        response_tx: tx,
     };
+    state.add_pending_install(pending).await;
 
-    let mut added = Vec::new();
+    tracing::info!("Install request pending approval: {}", req.dockerfile_commands.lines().next().unwrap_or("(empty)"));
 
-    // Add apt packages
-    if let Some(apt_packages) = &req.apt {
-        if !apt_packages.is_empty() {
-            let apt_line = format!(
-                "\nRUN apt-get update && apt-get install -y {}\n",
-                apt_packages.join(" ")
-            );
-            content.push_str(&apt_line);
-            added.push(format!("apt: {}", apt_packages.join(", ")));
+    // Wait for user response (with timeout)
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        rx
+    ).await;
+
+    match response {
+        Ok(Ok(true)) => {
+            let settings = get_settings();
+            let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
+            let extras_path = claude_dir.join("Dockerfile.extras");
+
+            // Hold lock to prevent concurrent read-modify-write
+            let _lock = state.config_lock.lock().await;
+
+            let commands = req.dockerfile_commands.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut content = if extras_path.exists() {
+                    std::fs::read_to_string(&extras_path)
+                        .map_err(|e| format!("Failed to read Dockerfile.extras: {}", e))?
+                } else {
+                    String::new()
+                };
+
+                if !content.is_empty() && !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                content.push_str(&commands);
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
+
+                std::fs::write(&extras_path, &content)
+                    .map_err(|e| format!("Failed to write Dockerfile.extras: {}", e))?;
+                Ok::<(), String>(())
+            }).await.map_err(|e| format!("Task join error: {}", e))??;
+
+            tracing::info!("Auto-restarting container to apply install changes...");
+            spawn_restart(&state);
+            Ok(format!(
+                "✓ Install approved. Added to Dockerfile.extras:\n```dockerfile\n{}\n```\nContainer is restarting...",
+                req.dockerfile_commands.trim(),
+            ))
+        }
+        Ok(Ok(false)) => {
+            Err("✗ Install request rejected by user.".to_string())
+        }
+        Ok(Err(_)) => {
+            Err("Install request was cancelled".to_string())
+        }
+        Err(_) => {
+            state.remove_pending_install(&request_id).await;
+            Err("Install request timed out (5 minutes). Please try again.".to_string())
         }
     }
-
-    // Add pip packages
-    if let Some(pip_packages) = &req.pip {
-        if !pip_packages.is_empty() {
-            let pip_line = format!("\nRUN pip3 install {}\n", pip_packages.join(" "));
-            content.push_str(&pip_line);
-            added.push(format!("pip: {}", pip_packages.join(", ")));
-        }
-    }
-
-    // Write updated content
-    std::fs::write(&extras_path, content)
-        .map_err(|e| format!("Failed to write Dockerfile.extras: {}", e))?;
-
-    Ok(format!(
-        "Packages added to Dockerfile.extras:\n  {}\n\nRun 'restart_container' tool to rebuild and apply changes.",
-        added.join("\n  ")
-    ))
 }
 
 async fn call_list_mounts() -> Result<String, String> {
     let settings = get_settings();
     let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
-    let config_path = claude_dir.join("config.json");
 
-    if !config_path.exists() {
-        return Ok("No mounts configured.".to_string());
-    }
-
-    let content = std::fs::read_to_string(&config_path)
-        .map_err(|e| format!("Failed to read config: {}", e))?;
-    let config: BasilConfig = serde_json::from_str(&content).unwrap_or_default();
+    let config = tokio::task::spawn_blocking(move || {
+        docker::load_basil_config(&claude_dir)
+            .map_err(|e| format!("Failed to load config: {}", e))
+    }).await.map_err(|e| format!("Task join error: {}", e))??;
 
     if config.mounts.is_empty() {
         return Ok("No mounts configured.".to_string());
@@ -410,19 +595,51 @@ async fn call_list_mounts() -> Result<String, String> {
     Ok(output)
 }
 
-async fn call_restart_container() -> Result<String, String> {
-    let settings = get_settings();
-    let container_name = &settings.container_name;
-    let project_dir = &settings.default_working_dir;
+/// Signal not-ready and spawn the restart as an independent task.
+/// Must be called before returning the MCP response, because the MCP handler
+/// will be cancelled when stop_container kills the Claude CLI process.
+fn spawn_restart(state: &Arc<McpState>) {
+    // Mark not-ready synchronously so the UI sees it immediately,
+    // before the spawned task starts or the MCP response is sent.
+    state.init_state.set_not_ready_sync();
 
-    // Stop current container
-    docker::stop_container(container_name).await;
+    let state = state.clone();
+    tokio::spawn(async move {
+        use crate::init::InitPhase;
 
-    // Start new container (will pick up new config)
-    match docker::start_container(project_dir).await {
-        Ok(_) => Ok("Container restarted successfully. New mounts and packages are now available.".to_string()),
-        Err(e) => Err(format!("Failed to restart container: {}", e)),
-    }
+        // Serialize restarts: if one is already in progress, wait for it to
+        // finish then run another (which picks up all accumulated changes).
+        let _restart_guard = state.restart_lock.lock().await;
+
+        let init_state = &state.init_state;
+        init_state.set_not_ready_sync();
+        init_state.clear_for_rebuild().await;
+        init_state.set_phase(InitPhase::BuildingProjectImage).await;
+
+        let settings = get_settings();
+        let project_dir = &settings.default_working_dir;
+        let container_name = docker::get_container_name(project_dir);
+
+        // Stop current container (with timeout to avoid hanging forever)
+        let stop_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async { docker::stop_container(&container_name).await },
+        ).await;
+        if stop_result.is_err() {
+            tracing::error!("Timed out stopping container {}", container_name);
+        }
+
+        // Start new container (will pick up new config, reports progress via init_state)
+        match docker::start_container(project_dir, Some(init_state.clone())).await {
+            Ok(name) => {
+                init_state.set_ready(name).await;
+                tracing::info!("Container restarted successfully");
+            }
+            Err(e) => {
+                let msg = format!("Failed to restart container: {}", e);
+                tracing::error!("{}", msg);
+                init_state.set_failed(msg).await;
+            }
+        }
+    });
 }
-
-// Config types are imported from docker module

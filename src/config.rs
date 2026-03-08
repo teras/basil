@@ -15,7 +15,6 @@ pub struct Settings {
     pub project_path: String,
     pub default_working_dir: PathBuf,
     pub session_dir: PathBuf,
-    pub container_name: String,
 }
 
 impl Default for Settings {
@@ -29,7 +28,6 @@ impl Default for Settings {
             project_path: String::new(),
             default_working_dir: home.clone(),
             session_dir: home.join(".basil").join("sessions"),
-            container_name: String::new(),
         }
     }
 }
