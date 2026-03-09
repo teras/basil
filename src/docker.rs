@@ -54,6 +54,8 @@ CMD ["bash"]
 pub struct BasilConfig {
     #[serde(default)]
     pub mounts: Vec<MountConfig>,
+    #[serde(default)]
+    pub packages: Vec<PackageConfig>,
 }
 
 /// Mount configuration
@@ -69,8 +71,31 @@ pub struct MountConfig {
     pub reason: Option<String>,
 }
 
+/// Package installation configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageConfig {
+    pub commands: String,
+    #[serde(default)]
+    pub approved: bool,
+}
+
 fn default_true() -> bool {
     true
+}
+
+/// Expand ~ or ~/ at the start of a path to the user's home directory.
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|h| format!("{}/{}", h.to_string_lossy(), rest))
+            .unwrap_or_else(|| path.to_string());
+    }
+    path.to_string()
 }
 
 /// Parse "Step 3/7 : ..." into (3, 7)
@@ -245,7 +270,7 @@ This project is running inside Basil, an isolated Docker container for secure Cl
 ## Filesystem Access
 
 - `/workspace` → The project directory
-- Additional directories can be requested via MCP tools
+- `/workspace/.mounts/` → Approved host directories (via request_mount)
 
 You do not have access to the user's home directory, system configs, or paths outside /workspace unless explicitly mounted.
 
@@ -257,13 +282,17 @@ Direct installs (`apt install`, `pip install`, etc.) are NOT persistent and will
 ## Accessing Host Paths — MUST use request_mount
 
 Paths the user mentions (e.g. `~/data`) are on their machine, not in your container.
-**Always use the `request_mount` MCP tool** to request access. After approval the container restarts and the path becomes available.
+**Always use the `request_mount` MCP tool** to request access. After approval the container restarts and the path becomes available at `/workspace/.mounts/<name>`.
 
 ## MCP Tools
 
 - `request_mount` — Request host directory access (auto-restarts on approval)
-- `install_package` — Persistent package installation via Dockerfile (auto-restarts on approval)
-- `list_mounts` — Show configured mounts
+- `install_package` — Persistent package installation via Dockerfile commands (auto-restarts on approval)
+- `list_config` — Show project configuration (mounts and packages)
+
+## Configuration
+
+All project settings are stored in `~/.claude/config.json`. Use `list_config` to view current state.
 "#;
 
     std::fs::write(&claude_md_path, content)?;
@@ -432,24 +461,28 @@ async fn ensure_base_image(docker: &Docker, init_state: Option<&InitState>) -> R
     Ok(())
 }
 
-/// Build project image from Dockerfile.extras if it exists.
-/// Returns project-specific image name if extras exist, otherwise base image.
+/// Build project image from approved packages in config.json.
+/// Returns project-specific image name if packages exist, otherwise base image.
 async fn build_project_image(
     docker: &Docker,
     project_path: &Path,
     init_state: Option<&InitState>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let claude_dir = get_claude_dir(project_path);
-    let extras_path = claude_dir.join("Dockerfile.extras");
+    let config = load_basil_config(&claude_dir)?;
 
-    if !extras_path.exists() {
-        tracing::debug!("No Dockerfile.extras found, using base image");
+    let approved_commands: Vec<&str> = config.packages.iter()
+        .filter(|p| p.approved)
+        .map(|p| p.commands.as_str())
+        .collect();
+
+    if approved_commands.is_empty() {
+        tracing::debug!("No approved packages, using base image");
         return Ok(BASE_IMAGE.to_string());
     }
 
     let image_name = get_custom_image_name(project_path);
-    let extras_content = std::fs::read_to_string(&extras_path)?;
-    let dockerfile = format!("FROM {}\n{}", BASE_IMAGE, extras_content);
+    let dockerfile = format!("FROM {}\n{}", BASE_IMAGE, approved_commands.join("\n"));
 
     tracing::info!("Building project image '{}'...", image_name);
     if let Some(state) = init_state {
@@ -478,43 +511,8 @@ fn update_gitignore(project_dir: &Path) {
     }
 }
 
-/// Start a warm container (sleep infinity) for executing Claude CLI
-pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitState>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let docker = Docker::connect_with_local_defaults()?;
-    docker.ping().await?;
-
-    let container_name = get_container_name(project_dir);
-    let claude_dir = get_claude_dir(project_dir);
-    let state_ref = init_state.as_deref();
-
-    // Check if already running
-    if is_container_running(&docker, &container_name).await {
-        tracing::debug!("Container already running: {}", container_name);
-        return Ok(container_name);
-    }
-
-    // Ensure base image exists (auto-build if needed)
-    ensure_base_image(&docker, state_ref).await?;
-
-    // Build project image (basil:project-hash)
-    let image_name = build_project_image(&docker, project_dir, state_ref).await?;
-
-    if let Some(state) = state_ref {
-        state.set_phase(InitPhase::StartingContainer).await;
-    }
-
-    // Remove stopped container with same name
-    let _ = docker
-        .remove_container(
-            &container_name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await;
-
-    // Build mounts - start with default mounts
+/// Build the mount list for a container from project config.
+fn build_mounts(project_dir: &Path, claude_dir: &Path) -> Vec<Mount> {
     let mut mounts = vec![
         Mount {
             target: Some("/workspace".to_string()),
@@ -542,12 +540,13 @@ pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitStat
     }
 
     // Add approved extra mounts from config
-    if let Ok(config) = load_basil_config(&claude_dir) {
+    if let Ok(config) = load_basil_config(claude_dir) {
         for mount_config in config.mounts.iter().filter(|m| m.approved) {
-            tracing::info!("Adding extra mount: {} → {}", mount_config.host, mount_config.target);
+            let host_path = expand_tilde(&mount_config.host);
+            tracing::info!("Adding extra mount: {} → {}", host_path, mount_config.target);
             mounts.push(Mount {
                 target: Some(mount_config.target.clone()),
-                source: Some(mount_config.host.clone()),
+                source: Some(host_path),
                 typ: Some(MountTypeEnum::BIND),
                 read_only: Some(mount_config.readonly),
                 ..Default::default()
@@ -555,21 +554,42 @@ pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitStat
         }
     }
 
-    // Get current user id for permissions
+    mounts
+}
+
+/// Create and start a container with the given image and mounts.
+async fn create_and_start(
+    docker: &Docker,
+    container_name: &str,
+    image_name: &str,
+    project_dir: &Path,
+    claude_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Remove stopped container with same name
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    let mounts = build_mounts(project_dir, claude_dir);
+
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let user_str = format!("{}:{}", uid, gid);
 
     let host_config = HostConfig {
         mounts: Some(mounts),
-        auto_remove: Some(true),
-        // Enable host.docker.internal for MCP communication back to Basil
         extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
         ..Default::default()
     };
 
     let config: Config<String> = Config {
-        image: Some(image_name.clone()),
+        image: Some(image_name.to_string()),
         working_dir: Some("/workspace".to_string()),
         user: Some(user_str),
         env: Some(vec![
@@ -584,19 +604,68 @@ pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitStat
         ..Default::default()
     };
 
-    // Create container
     let options = CreateContainerOptions {
-        name: container_name.clone(),
+        name: container_name.to_string(),
         ..Default::default()
     };
     docker.create_container(Some(options), config).await?;
-
-    // Start container
     docker
-        .start_container(&container_name, None::<StartContainerOptions<String>>)
+        .start_container(container_name, None::<StartContainerOptions<String>>)
         .await?;
 
     tracing::info!("Container started: {} (image: {})", container_name, image_name);
+    Ok(())
+}
+
+/// Start a warm container (sleep infinity) for executing Claude CLI.
+/// Builds images if needed.
+pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitState>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let docker = Docker::connect_with_local_defaults()?;
+    docker.ping().await?;
+
+    let container_name = get_container_name(project_dir);
+    let claude_dir = get_claude_dir(project_dir);
+    let state_ref = init_state.as_deref();
+
+    if is_container_running(&docker, &container_name).await {
+        tracing::debug!("Container already running: {}", container_name);
+        return Ok(container_name);
+    }
+
+    ensure_base_image(&docker, state_ref).await?;
+    let image_name = build_project_image(&docker, project_dir, state_ref).await?;
+
+    if let Some(state) = state_ref {
+        state.set_phase(InitPhase::StartingContainer).await;
+    }
+
+    create_and_start(&docker, &container_name, &image_name, project_dir, &claude_dir).await?;
+    Ok(container_name)
+}
+
+/// Restart container without rebuilding images (for mount-only changes).
+pub async fn restart_container_only(project_dir: &Path, init_state: Option<Arc<InitState>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let docker = Docker::connect_with_local_defaults()?;
+    docker.ping().await?;
+
+    let container_name = get_container_name(project_dir);
+    let claude_dir = get_claude_dir(project_dir);
+
+    if let Some(state) = init_state.as_deref() {
+        state.set_phase(InitPhase::StartingContainer).await;
+    }
+
+    // Determine which image to use (project image if packages exist, else base)
+    let image_name = {
+        let config = load_basil_config(&claude_dir).unwrap_or_default();
+        if config.packages.iter().any(|p| p.approved) {
+            get_custom_image_name(project_dir)
+        } else {
+            BASE_IMAGE.to_string()
+        }
+    };
+
+    create_and_start(&docker, &container_name, &image_name, project_dir, &claude_dir).await?;
     Ok(container_name)
 }
 
@@ -606,7 +675,16 @@ pub async fn stop_container(container_name: &str) {
         let _ = docker
             .stop_container(container_name, Some(StopContainerOptions { t: 2 }))
             .await;
-        tracing::debug!("Container stopped: {}", container_name);
+        let _ = docker
+            .remove_container(
+                container_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        tracing::debug!("Container stopped and removed: {}", container_name);
     }
 }
 

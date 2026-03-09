@@ -240,7 +240,7 @@ fn get_tool_definitions() -> Value {
     json!([
         {
             "name": "request_mount",
-            "description": "Request access to a directory on the USER'S MACHINE (host). You cannot access paths outside /workspace directly - use this tool first. The 'path' parameter is the path on the user's machine (e.g., /home/user/data, ~/datasets). After user approval, the container auto-restarts and the directory becomes accessible.",
+            "description": "Request access to a directory on the USER'S MACHINE (host). You cannot access paths outside /workspace directly - use this tool first. The 'path' parameter is the path on the user's machine (e.g., /home/user/data, ~/datasets). After user approval, the container auto-restarts and the directory becomes accessible at /workspace/.mounts/<name>.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -250,7 +250,7 @@ fn get_tool_definitions() -> Value {
                     },
                     "target": {
                         "type": "string",
-                        "description": "Where to mount inside the container (e.g., /data). If omitted, defaults to /mnt/<basename>"
+                        "description": "Where to mount inside the container. If omitted, defaults to /workspace/.mounts/<basename>"
                     },
                     "readonly": {
                         "type": "boolean",
@@ -266,7 +266,7 @@ fn get_tool_definitions() -> Value {
         },
         {
             "name": "install_package",
-            "description": "Add Dockerfile commands for persistent package installation. Commands are appended to Dockerfile.extras and applied automatically after user approval (container auto-restarts). Use standard Dockerfile syntax (RUN, ENV, COPY, etc.). Works for ANY package manager: apt, pip, cargo, npm, rustup, or custom install scripts.",
+            "description": "Add Dockerfile commands for persistent package installation. Saved to project config and applied automatically after user approval (container auto-restarts). Use standard Dockerfile syntax (RUN, ENV, COPY, etc.). Works for ANY package manager: apt, pip, cargo, npm, rustup, or custom install scripts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -279,8 +279,8 @@ fn get_tool_definitions() -> Value {
             }
         },
         {
-            "name": "list_mounts",
-            "description": "Show all configured mounts for this project. Displays both approved (active) and pending (awaiting user approval) mounts.",
+            "name": "list_config",
+            "description": "Show the project's Basil configuration: approved mounts and installed packages.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false
@@ -346,7 +346,7 @@ async fn handle_tools_call(state: Arc<McpState>, id: Option<Value>, params: Valu
     let result = match name {
         "request_mount" => call_request_mount(state.clone(), arguments).await,
         "install_package" => call_install_package(state.clone(), arguments).await,
-        "list_mounts" => call_list_mounts().await,
+        "list_config" => call_list_config().await,
         _ => Err(format!("Unknown tool: {}", name)),
     };
 
@@ -381,8 +381,15 @@ struct MountRequest {
 }
 
 async fn call_request_mount(state: Arc<McpState>, args: Value) -> Result<String, String> {
-    let req: MountRequest = serde_json::from_value(args)
+    let mut req: MountRequest = serde_json::from_value(args)
         .map_err(|e| format!("Invalid arguments: {}", e))?;
+
+    // Expand ~ to absolute path (Docker requires absolute mount paths)
+    req.path = docker::expand_tilde(&req.path);
+
+    if !req.path.starts_with('/') {
+        return Err(format!("Mount path must be absolute, got: {}", req.path));
+    }
 
     let settings = get_settings();
     let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
@@ -392,7 +399,7 @@ async fn call_request_mount(state: Arc<McpState>, args: Value) -> Result<String,
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("mount");
-        format!("/mnt/{}", basename)
+        format!("/workspace/.mounts/{}", basename)
     });
     let readonly = req.readonly.unwrap_or(true);
 
@@ -465,7 +472,7 @@ async fn call_request_mount(state: Arc<McpState>, args: Value) -> Result<String,
                 }).await.map_err(|e| format!("Task join error: {}", e))??;
 
                 tracing::info!("Auto-restarting container to apply mount...");
-                spawn_restart(&state);
+                spawn_restart(&state, false);
                 Ok(format!(
                     "✓ Mount approved: {} → {} ({}). Container is restarting...",
                     req.path, target,
@@ -522,37 +529,32 @@ async fn call_install_package(state: Arc<McpState>, args: Value) -> Result<Strin
         Ok(Ok(true)) => {
             let settings = get_settings();
             let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
-            let extras_path = claude_dir.join("Dockerfile.extras");
 
             // Hold lock to prevent concurrent read-modify-write
             let _lock = state.config_lock.lock().await;
 
             let commands = req.dockerfile_commands.clone();
             tokio::task::spawn_blocking(move || {
-                let mut content = if extras_path.exists() {
-                    std::fs::read_to_string(&extras_path)
-                        .map_err(|e| format!("Failed to read Dockerfile.extras: {}", e))?
-                } else {
-                    String::new()
-                };
+                let mut config = docker::load_basil_config(&claude_dir)
+                    .map_err(|e| format!("Failed to load config: {}", e))?;
 
-                if !content.is_empty() && !content.ends_with('\n') {
-                    content.push('\n');
-                }
-                content.push_str(&commands);
-                if !content.ends_with('\n') {
-                    content.push('\n');
-                }
+                config.packages.push(docker::PackageConfig {
+                    commands,
+                    approved: true,
+                });
 
-                std::fs::write(&extras_path, &content)
-                    .map_err(|e| format!("Failed to write Dockerfile.extras: {}", e))?;
+                let config_path = claude_dir.join("config.json");
+                let content = serde_json::to_string_pretty(&config)
+                    .map_err(|e| format!("Failed to serialize config: {}", e))?;
+                std::fs::write(&config_path, content)
+                    .map_err(|e| format!("Failed to write config: {}", e))?;
                 Ok::<(), String>(())
             }).await.map_err(|e| format!("Task join error: {}", e))??;
 
             tracing::info!("Auto-restarting container to apply install changes...");
-            spawn_restart(&state);
+            spawn_restart(&state, true);
             Ok(format!(
-                "✓ Install approved. Added to Dockerfile.extras:\n```dockerfile\n{}\n```\nContainer is restarting...",
+                "✓ Install approved:\n```dockerfile\n{}\n```\nContainer is restarting...",
                 req.dockerfile_commands.trim(),
             ))
         }
@@ -569,7 +571,7 @@ async fn call_install_package(state: Arc<McpState>, args: Value) -> Result<Strin
     }
 }
 
-async fn call_list_mounts() -> Result<String, String> {
+async fn call_list_config() -> Result<String, String> {
     let settings = get_settings();
     let claude_dir = docker::get_claude_dir(&settings.default_working_dir);
 
@@ -578,18 +580,32 @@ async fn call_list_mounts() -> Result<String, String> {
             .map_err(|e| format!("Failed to load config: {}", e))
     }).await.map_err(|e| format!("Task join error: {}", e))??;
 
-    if config.mounts.is_empty() {
-        return Ok("No mounts configured.".to_string());
+    if config.mounts.is_empty() && config.packages.is_empty() {
+        return Ok("No mounts or packages configured.".to_string());
     }
 
-    let mut output = String::from("Configured mounts:\n");
-    for mount in &config.mounts {
-        let status = if mount.approved { "✓" } else { "⏳" };
-        let mode = if mount.readonly { "ro" } else { "rw" };
-        output.push_str(&format!(
-            "  {} {} → {} ({})\n",
-            status, mount.host, mount.target, mode
-        ));
+    let mut output = String::new();
+
+    if !config.mounts.is_empty() {
+        output.push_str("Mounts:\n");
+        for mount in &config.mounts {
+            let status = if mount.approved { "✓" } else { "⏳" };
+            let mode = if mount.readonly { "ro" } else { "rw" };
+            output.push_str(&format!(
+                "  {} {} → {} ({})\n",
+                status, mount.host, mount.target, mode
+            ));
+        }
+    }
+
+    if !config.packages.is_empty() {
+        if !output.is_empty() { output.push('\n'); }
+        output.push_str("Packages:\n");
+        for pkg in &config.packages {
+            let status = if pkg.approved { "✓" } else { "⏳" };
+            let summary = pkg.commands.lines().next().unwrap_or("(empty)");
+            output.push_str(&format!("  {} {}\n", status, summary));
+        }
     }
 
     Ok(output)
@@ -598,7 +614,10 @@ async fn call_list_mounts() -> Result<String, String> {
 /// Signal not-ready and spawn the restart as an independent task.
 /// Must be called before returning the MCP response, because the MCP handler
 /// will be cancelled when stop_container kills the Claude CLI process.
-fn spawn_restart(state: &Arc<McpState>) {
+///
+/// `rebuild_image`: true for install_package (needs image rebuild), false for
+/// mount-only changes (just restart container with new config).
+fn spawn_restart(state: &Arc<McpState>, rebuild_image: bool) {
     // Mark not-ready synchronously so the UI sees it immediately,
     // before the spawned task starts or the MCP response is sent.
     state.init_state.set_not_ready_sync();
@@ -614,11 +633,16 @@ fn spawn_restart(state: &Arc<McpState>) {
         let init_state = &state.init_state;
         init_state.set_not_ready_sync();
         init_state.clear_for_rebuild().await;
-        init_state.set_phase(InitPhase::BuildingProjectImage).await;
 
         let settings = get_settings();
         let project_dir = &settings.default_working_dir;
         let container_name = docker::get_container_name(project_dir);
+
+        if rebuild_image {
+            init_state.set_phase(InitPhase::BuildingProjectImage).await;
+        } else {
+            init_state.set_phase(InitPhase::StartingContainer).await;
+        }
 
         // Stop current container (with timeout to avoid hanging forever)
         let stop_result = tokio::time::timeout(
@@ -630,7 +654,13 @@ fn spawn_restart(state: &Arc<McpState>) {
         }
 
         // Start new container (will pick up new config, reports progress via init_state)
-        match docker::start_container(project_dir, Some(init_state.clone())).await {
+        let result = if rebuild_image {
+            docker::start_container(project_dir, Some(init_state.clone())).await
+        } else {
+            docker::restart_container_only(project_dir, Some(init_state.clone())).await
+        };
+
+        match result {
             Ok(name) => {
                 init_state.set_ready(name).await;
                 tracing::info!("Container restarted successfully");

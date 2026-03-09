@@ -19,7 +19,7 @@ You are running inside an isolated Docker container managed by Basil.
 
 ## Your filesystem view:
 - /workspace → The user's project directory
-- Approved mounts from request_mount tool
+- /workspace/.mounts/ → Approved mounts from request_mount tool (e.g. /workspace/.mounts/Desktop)
 - That's it. You cannot see anything else on the user's machine.
 
 ## What you CANNOT access directly:
@@ -42,14 +42,14 @@ Do NOT run install commands directly — always use install_package.
 
 When the user mentions a path (e.g., "~/data", "/home/user/datasets"), they mean a path on THEIR machine, not inside your container. You cannot access these paths directly.
 
-**You MUST use the `request_mount` MCP tool to request access to host directories.** After user approval, the container auto-restarts and the directory becomes available inside your environment.
+**You MUST use the `request_mount` MCP tool to request access to host directories.** After user approval, the container auto-restarts and the directory becomes available at `/workspace/.mounts/<name>`.
 
 Do NOT attempt to read/write paths outside /workspace without first requesting a mount.
 
 ## All Basil MCP tools:
 - `request_mount` — Request access to a host directory. Requires user approval; container auto-restarts.
 - `install_package` — Persistently install packages via Dockerfile commands. Requires user approval; container auto-restarts.
-- `list_mounts` — Show currently configured mounts and their approval status.
+- `list_config` — Show project configuration: approved mounts and installed packages.
 
 ## Best practices:
 - ALWAYS use install_package for any package installation — direct installs are not persistent
@@ -125,10 +125,12 @@ pub async fn run_claude(
 
     if plan_mode {
         claude_args.extend(["--permission-mode".to_string(), "plan".to_string()]);
-        // Allow Basil MCP tools in plan mode — they have their own approval flow via the UI
+
+        // Allow Basil MCP tools in plan mode — they have their own approval flow via the UI.
+        // Mounts go under /workspace/.mounts/ so Claude can read them without extra permissions.
         claude_args.extend([
             "--allowedTools".to_string(),
-            "mcp__basil__install_package,mcp__basil__request_mount,mcp__basil__list_mounts".to_string(),
+            "mcp__basil__install_package,mcp__basil__request_mount,mcp__basil__list_config".to_string(),
         ]);
     } else {
         claude_args.push("--dangerously-skip-permissions".to_string());
