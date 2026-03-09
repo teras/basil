@@ -1245,12 +1245,11 @@ async function handleApprovalResponse(endpoint, approved, dialogElement, label) 
         });
 
         const data = await resp.json();
+        const content = dialogElement.querySelector('.interactive-tool');
+        content.classList.add('submitted');
+        dialogElement.querySelector('.mount-buttons')?.remove();
+
         if (data.ok) {
-            const content = dialogElement.querySelector('.interactive-tool');
-            content.classList.add('submitted');
-
-            dialogElement.querySelector('.mount-buttons')?.remove();
-
             const status = document.createElement('div');
             status.className = 'mount-status';
             status.textContent = approved ? `✓ ${label} approved — rebuilding...` : `✗ ${label} rejected`;
@@ -1275,6 +1274,12 @@ async function handleApprovalResponse(endpoint, approved, dialogElement, label) 
                     setButtonMode(false);
                 }
             }
+        } else {
+            // Request was cancelled (e.g. container restarted due to another approval)
+            const status = document.createElement('div');
+            status.className = 'mount-status expired';
+            status.textContent = `${label} request expired — will be re-requested after restart`;
+            content.appendChild(status);
         }
     } catch (e) {
         console.error(`Failed to respond to ${label.toLowerCase()}:`, e);

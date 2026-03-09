@@ -101,7 +101,9 @@ async fn respond_to_mount(
     Json(body): Json<ApprovalResponseBody>,
 ) -> Result<Json<ApprovalResponseResult>, StatusCode> {
     require_loopback(addr)?;
+    tracing::debug!("API respond_to_mount [{}] approved={}", id, body.approved);
     let ok = state.respond_to_mount(&id, body.approved).await;
+    tracing::debug!("API respond_to_mount [{}] result ok={}", id, ok);
     Ok(Json(approval_result(ok, "Mount", body.approved)))
 }
 
@@ -113,7 +115,9 @@ async fn respond_to_install(
     Json(body): Json<ApprovalResponseBody>,
 ) -> Result<Json<ApprovalResponseResult>, StatusCode> {
     require_loopback(addr)?;
+    tracing::debug!("API respond_to_install [{}] approved={}", id, body.approved);
     let ok = state.respond_to_install(&id, body.approved).await;
+    tracing::debug!("API respond_to_install [{}] result ok={}", id, ok);
     Ok(Json(approval_result(ok, "Install", body.approved)))
 }
 

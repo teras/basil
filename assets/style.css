@@ -1038,6 +1038,12 @@ body {
     color: #ef4444;
 }
 
+.mount-request .mount-status.expired {
+    background: rgba(250, 204, 21, 0.1);
+    border: 1px solid rgba(250, 204, 21, 0.3);
+    color: #facc15;
+}
+
 .mount-request.submitted {
     pointer-events: none;
 }

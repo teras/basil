@@ -140,8 +140,13 @@ pub async fn run_claude(
     }
 
     if let Some(ref claude_id) = claude_session_id {
+        tracing::debug!("run_claude: resuming claude session {}", claude_id);
         claude_args.extend(["--resume".to_string(), claude_id.clone()]);
+    } else {
+        tracing::debug!("run_claude: starting new claude session");
     }
+
+    tracing::debug!("run_claude: message preview: {:?}", &message[..message.len().min(150)]);
 
     // Build docker exec command
     let mut cmd = Command::new("docker");
@@ -197,6 +202,8 @@ async fn run_process(
     init_state: Arc<InitState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut child = cmd.spawn()?;
+    let pid = child.id().unwrap_or(0);
+    tracing::debug!("run_process: spawned pid={}", pid);
 
     // Write message to stdin and close it
     if let Some(mut stdin) = child.stdin.take() {
@@ -205,9 +212,23 @@ async fn run_process(
     }
 
     let stdout = child.stdout.take().ok_or("No stdout")?;
+    let stderr = child.stderr.take();
     let mut reader = BufReader::new(stdout).lines();
 
+    // Capture stderr in background
+    let stderr_handle = stderr.map(|se| {
+        tokio::spawn(async move {
+            let mut stderr_reader = BufReader::new(se).lines();
+            let mut stderr_lines = Vec::new();
+            while let Ok(Some(line)) = stderr_reader.next_line().await {
+                stderr_lines.push(line);
+            }
+            stderr_lines
+        })
+    });
+
     let mut last_text = String::new();
+    let mut line_count: u64 = 0;
 
     loop {
         tokio::select! {
@@ -221,13 +242,21 @@ async fn run_process(
             line = reader.next_line() => {
                 match line {
                     Ok(Some(line)) => {
+                        line_count += 1;
+                        if line_count == 1 {
+                            tracing::debug!("run_process: first stdout line received");
+                        }
+
                         if line.is_empty() {
                             continue;
                         }
 
                         let data: serde_json::Value = match serde_json::from_str(&line) {
                             Ok(d) => d,
-                            Err(_) => continue,
+                            Err(_) => {
+                                tracing::debug!("run_process: non-JSON line: {:?}", &line[..line.len().min(200)]);
+                                continue;
+                            }
                         };
 
                         let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -326,9 +355,11 @@ async fn run_process(
                     }
                     Ok(None) => {
                         // EOF - process finished
+                        tracing::debug!("run_process: stdout EOF after {} lines", line_count);
                         break;
                     }
                     Err(e) => {
+                        tracing::debug!("run_process: stdout read error after {} lines: {}", line_count, e);
                         let block_id = sessions.next_block_id(&session_id).await;
                         sender.send(ResponseBlock::error(block_id, format!("Read error: {}", e))).await.ok();
                         break;
@@ -338,39 +369,53 @@ async fn run_process(
         }
     }
 
+    // Collect stderr from background task
+    let stderr_output = if let Some(handle) = stderr_handle {
+        handle.await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !stderr_output.is_empty() {
+        tracing::debug!("run_process: stderr ({} lines): {}", stderr_output.len(),
+            stderr_output.iter().take(10).cloned().collect::<Vec<_>>().join("\n"));
+    }
+
     // Wait for process with timeout (container restart can kill it)
     let wait_result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        child.wait_with_output(),
+        child.wait(),
     ).await;
 
     match wait_result {
-        Ok(Ok(output)) if !output.status.success() && !output.stderr.is_empty() => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Don't report errors during container rebuild — the init overlay handles it
-            if !init_state.is_ready() {
-                tracing::debug!("Claude process exited during container rebuild");
-            } else {
-                let block_id = sessions.next_block_id(&session_id).await;
-                sender
-                    .send(ResponseBlock::error(
-                        block_id,
-                        format!("Claude error: {}", &stderr[..stderr.len().min(500)]),
-                    ))
-                    .await
-                    .ok();
+        Ok(Ok(status)) => {
+            tracing::debug!("run_process: exited with {} (stdout lines: {})", status, line_count);
+            if !status.success() && !stderr_output.is_empty() {
+                let stderr_str = stderr_output.join("\n");
+                // Don't report errors during container rebuild — the init overlay handles it
+                if !init_state.is_ready() {
+                    tracing::debug!("Claude process exited during container rebuild");
+                } else {
+                    let block_id = sessions.next_block_id(&session_id).await;
+                    sender
+                        .send(ResponseBlock::error(
+                            block_id,
+                            format!("Claude error: {}", &stderr_str[..stderr_str.len().min(500)]),
+                        ))
+                        .await
+                        .ok();
+                }
             }
         }
         Ok(Err(e)) => {
+            tracing::debug!("run_process: wait error: {}", e);
             if init_state.is_ready() {
                 let block_id = sessions.next_block_id(&session_id).await;
                 sender.send(ResponseBlock::error(block_id, format!("Process error: {}", e))).await.ok();
             }
         }
         Err(_) => {
-            tracing::warn!("Timed out waiting for Claude process to exit");
+            tracing::warn!("Timed out waiting for Claude process to exit (pid={})", pid);
         }
-        _ => {}
     }
 
     Ok(())

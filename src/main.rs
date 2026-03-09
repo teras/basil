@@ -26,7 +26,7 @@ use axum::{
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tower_http::cors::{Any, CorsLayer};
-use tracing_subscriber::{fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 use config::{get_settings, init_settings, Settings};
 use init::{InitPhase, InitState};
@@ -52,6 +52,10 @@ struct Args {
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
+
+    /// Write logs to file (enables debug level automatically)
+    #[arg(long, value_name = "FILE")]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -59,20 +63,46 @@ async fn main() {
     let args = Args::parse();
 
     // Initialize logging
-    let log_level = if args.debug { "basil=debug" } else { "basil=info" };
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| log_level.into()),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_timer(LocalTime::new(time::macros::format_description!(
-                    "[year]-[month]-[day] [hour]:[minute]:[second]"
-                ))),
-        )
-        .init();
+    let has_log_file = args.log_file.is_some();
+    let log_level = if args.debug || has_log_file { "basil=debug" } else { "basil=info" };
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| log_level.into());
+    let time_format = LocalTime::new(time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second]"
+    ));
+
+    if let Some(ref log_path) = args.log_file {
+        let log_file = std::fs::File::create(log_path).unwrap_or_else(|e| {
+            eprintln!("Cannot create log file {}: {}", log_path.display(), e);
+            std::process::exit(1);
+        });
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_timer(time_format.clone())
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(log_file)),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_timer(time_format)
+                    .with_filter(tracing_subscriber::EnvFilter::new("basil=info")),
+            )
+            .init();
+        eprintln!("Logging to {}", log_path.display());
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_timer(time_format),
+            )
+            .init();
+    }
 
     // Canonicalize project path
     let project_dir = match std::fs::canonicalize(&args.path) {

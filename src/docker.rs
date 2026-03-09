@@ -656,32 +656,6 @@ async fn start_container_inner(project_dir: &Path, init_state: Option<Arc<InitSt
     Ok(container_name)
 }
 
-/// Restart container without rebuilding images (for mount-only changes).
-pub async fn restart_container_only(project_dir: &Path, init_state: Option<Arc<InitState>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let docker = Docker::connect_with_local_defaults()?;
-    docker.ping().await?;
-
-    let container_name = get_container_name(project_dir);
-    let claude_dir = get_claude_dir(project_dir);
-
-    if let Some(state) = init_state.as_deref() {
-        state.set_phase(InitPhase::StartingContainer).await;
-    }
-
-    // Determine which image to use (project image if packages exist, else base)
-    let image_name = {
-        let config = load_basil_config(&claude_dir).unwrap_or_default();
-        if config.packages.iter().any(|p| p.approved) {
-            get_custom_image_name(project_dir)
-        } else {
-            BASE_IMAGE.to_string()
-        }
-    };
-
-    create_and_start(&docker, &container_name, &image_name, project_dir, &claude_dir).await?;
-    Ok(container_name)
-}
-
 /// Stop and remove container, waiting until it's fully gone.
 pub async fn stop_container(container_name: &str) {
     if let Ok(docker) = Docker::connect_with_local_defaults() {
