@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Panayotis Katsaloulis
+
 //! Docker container management - start/stop warm container for Claude CLI execution.
 
 use crate::init::{InitPhase, InitState};
@@ -618,8 +621,18 @@ async fn create_and_start(
 }
 
 /// Start a warm container (sleep infinity) for executing Claude CLI.
-/// Builds images if needed.
+/// Builds images if needed. Reuses existing running container on initial startup.
 pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitState>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    start_container_inner(project_dir, init_state, false).await
+}
+
+/// Start a warm container, always rebuilding even if one is already running.
+/// Used after install_package to ensure the new image is applied.
+pub async fn start_container_fresh(project_dir: &Path, init_state: Option<Arc<InitState>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    start_container_inner(project_dir, init_state, true).await
+}
+
+async fn start_container_inner(project_dir: &Path, init_state: Option<Arc<InitState>>, force: bool) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let docker = Docker::connect_with_local_defaults()?;
     docker.ping().await?;
 
@@ -627,7 +640,7 @@ pub async fn start_container(project_dir: &Path, init_state: Option<Arc<InitStat
     let claude_dir = get_claude_dir(project_dir);
     let state_ref = init_state.as_deref();
 
-    if is_container_running(&docker, &container_name).await {
+    if !force && is_container_running(&docker, &container_name).await {
         tracing::debug!("Container already running: {}", container_name);
         return Ok(container_name);
     }
@@ -669,7 +682,7 @@ pub async fn restart_container_only(project_dir: &Path, init_state: Option<Arc<I
     Ok(container_name)
 }
 
-/// Stop and remove container
+/// Stop and remove container, waiting until it's fully gone.
 pub async fn stop_container(container_name: &str) {
     if let Ok(docker) = Docker::connect_with_local_defaults() {
         let _ = docker
@@ -684,6 +697,15 @@ pub async fn stop_container(container_name: &str) {
                 }),
             )
             .await;
+
+        // Wait until the container is truly gone (Docker API can lag)
+        for _ in 0..20 {
+            if !is_container_running(&docker, container_name).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
         tracing::debug!("Container stopped and removed: {}", container_name);
     }
 }

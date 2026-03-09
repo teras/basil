@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Panayotis Katsaloulis
+
 //! MCP (Model Context Protocol) server implementation.
 //!
 //! Provides JSON-RPC 2.0 over HTTP for Claude to interact with Basil.
@@ -10,6 +13,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::config::get_settings;
 use crate::docker::{self, MountConfig};
+use crate::services::SessionManager;
 
 /// MCP protocol version
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -47,10 +51,12 @@ pub struct McpState {
     approval_notify: tokio::sync::Notify,
     /// Serializes container restarts to prevent concurrent stop/start races
     restart_lock: Mutex<()>,
+    /// Chat session manager — used to auto-resume sessions after container restart
+    chat_sessions: Option<Arc<SessionManager>>,
 }
 
 impl McpState {
-    pub fn new(init_state: Arc<crate::init::InitState>) -> Arc<Self> {
+    pub fn new(init_state: Arc<crate::init::InitState>, chat_sessions: Arc<SessionManager>) -> Arc<Self> {
         Arc::new(Self {
             sessions: RwLock::new(HashSet::new()),
             pending_mounts: RwLock::new(HashMap::new()),
@@ -60,6 +66,7 @@ impl McpState {
             sent_approval_ids: RwLock::new(HashSet::new()),
             approval_notify: tokio::sync::Notify::new(),
             restart_lock: Mutex::new(()),
+            chat_sessions: Some(chat_sessions),
         })
     }
 
@@ -463,10 +470,12 @@ async fn call_request_mount(state: Arc<McpState>, args: Value) -> Result<String,
                         });
 
                         let config_path = claude_dir_inner.join("config.json");
+                        tracing::info!("Writing mount config to: {}", config_path.display());
                         let content = serde_json::to_string_pretty(&config)
                             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-                        std::fs::write(&config_path, content)
+                        std::fs::write(&config_path, &content)
                             .map_err(|e| format!("Failed to write config: {}", e))?;
+                        tracing::info!("Mount config written OK: {}", content);
                     }
                     Ok::<(), String>(())
                 }).await.map_err(|e| format!("Task join error: {}", e))??;
@@ -544,10 +553,12 @@ async fn call_install_package(state: Arc<McpState>, args: Value) -> Result<Strin
                 });
 
                 let config_path = claude_dir.join("config.json");
+                tracing::info!("Writing install config to: {}", config_path.display());
                 let content = serde_json::to_string_pretty(&config)
                     .map_err(|e| format!("Failed to serialize config: {}", e))?;
-                std::fs::write(&config_path, content)
+                std::fs::write(&config_path, &content)
                     .map_err(|e| format!("Failed to write config: {}", e))?;
+                tracing::info!("Install config written OK");
                 Ok::<(), String>(())
             }).await.map_err(|e| format!("Task join error: {}", e))??;
 
@@ -625,10 +636,20 @@ fn spawn_restart(state: &Arc<McpState>, rebuild_image: bool) {
     let state = state.clone();
     tokio::spawn(async move {
         use crate::init::InitPhase;
+        use crate::services::run_claude;
 
         // Serialize restarts: if one is already in progress, wait for it to
         // finish then run another (which picks up all accumulated changes).
         let _restart_guard = state.restart_lock.lock().await;
+
+        // Capture which sessions are currently processing BEFORE stopping the
+        // container — once the container dies the Claude processes exit and
+        // set is_processing=false, so we'd lose this information.
+        let interrupted_sessions = if let Some(ref sessions) = state.chat_sessions {
+            sessions.get_processing_sessions().await
+        } else {
+            Vec::new()
+        };
 
         let init_state = &state.init_state;
         init_state.set_not_ready_sync();
@@ -653,17 +674,70 @@ fn spawn_restart(state: &Arc<McpState>, rebuild_image: bool) {
             tracing::error!("Timed out stopping container {}", container_name);
         }
 
-        // Start new container (will pick up new config, reports progress via init_state)
+        // Start new container (will pick up new config, reports progress via init_state).
+        // Always use fresh start to avoid reusing a stale container/image.
         let result = if rebuild_image {
-            docker::start_container(project_dir, Some(init_state.clone())).await
+            docker::start_container_fresh(project_dir, Some(init_state.clone())).await
         } else {
             docker::restart_container_only(project_dir, Some(init_state.clone())).await
         };
 
         match result {
             Ok(name) => {
+                // Prepare auto-resume BEFORE marking ready, so the UI sees
+                // is_processing=true as soon as it starts polling after rebuild.
+                let mut continuations = Vec::new();
+                if let Some(ref sessions) = state.chat_sessions {
+                    for (session_id, plan_mode) in &interrupted_sessions {
+                        // Wait for the old run_claude to finish cleaning up
+                        // (it sets is_processing=false after the process exits)
+                        for _ in 0..50 {
+                            if !sessions.is_processing(session_id).await {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+
+                        let what_changed = if rebuild_image {
+                            "Package installation completed and is now available"
+                        } else {
+                            "Mount has been applied and the directory is now accessible"
+                        };
+                        let continuation = format!(
+                            "Container restarted successfully. {}. \
+                            Continue with any remaining work.",
+                            what_changed
+                        );
+
+                        sessions.create_channel(session_id).await;
+                        sessions.add_message(session_id, "user", &continuation).await;
+                        sessions.set_processing(session_id, true).await;
+
+                        continuations.push((session_id.clone(), plan_mode, continuation));
+                    }
+                }
+
                 init_state.set_ready(name).await;
                 tracing::info!("Container restarted successfully");
+
+                // Now spawn the actual Claude processes
+                if let Some(ref sessions) = state.chat_sessions {
+                    for (session_id, plan_mode, continuation) in continuations {
+                        tracing::info!("Auto-resuming session {} after container restart", session_id);
+                        let sessions_clone = sessions.clone();
+                        let init_clone = init_state.clone();
+                        let plan = *plan_mode;
+                        tokio::spawn(async move {
+                            run_claude(
+                                sessions_clone,
+                                session_id,
+                                continuation,
+                                plan,
+                                init_clone,
+                            ).await;
+                        });
+                    }
+                }
             }
             Err(e) => {
                 let msg = format!("Failed to restart container: {}", e);

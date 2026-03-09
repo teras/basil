@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Panayotis Katsaloulis
+
 //! Basil - HTTP API bridge for Claude Code CLI
 //!
 //! Single binary distribution with embedded UI. Docker used for isolated CLI execution.
@@ -156,7 +159,7 @@ async fn request_logging(
     let msg = format!("{ip} {method} {path} → {status} ({latency}ms)");
 
     if path == "/health" || path == "/api/health" || path == "/api/status" {
-        tracing::debug!("{msg}");
+        tracing::trace!("{msg}");
     } else if status.is_success() {
         tracing::info!("{msg}");
     } else if status.is_client_error() {
@@ -191,7 +194,7 @@ async fn run_server(project_dir: &PathBuf, port: u16, serve_ui: bool, init_state
 
     // Create session manager and MCP state
     let sessions = SessionManager::new();
-    let mcp_state = mcp::McpState::new(init_state.clone());
+    let mcp_state = mcp::McpState::new(init_state.clone(), sessions.clone());
 
     // Build router
     let mut app = Router::new()

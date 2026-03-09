@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Panayotis Katsaloulis
+
 // ============================================================================
 // Initialization Status Polling
 // ============================================================================
@@ -1254,14 +1257,23 @@ async function handleApprovalResponse(endpoint, approved, dialogElement, label) 
             status.classList.add(approved ? 'approved' : 'rejected');
             content.appendChild(status);
 
-            // On approval, show init overlay for rebuild progress
+            // On approval, show init overlay for rebuild progress, then auto-resume
             if (approved) {
                 systemReady = false;
                 await pollInitStatus();
-                // System is ready again — show confirmation in chat
-                const sysMsg = createMessageElement('assistant');
-                sysMsg.textContent = 'Container rebuilt successfully. Send a message to continue.';
+                // System is ready — backend auto-resumes the Claude session.
+                // Start polling to pick up continuation responses.
+                isProcessing = true;
+                setButtonMode(true);
+                typingIndicator.classList.add('active');
+                chatContainer.appendChild(typingIndicator);
                 scrollToBottom();
+                try {
+                    await pollResponses(currentSession);
+                } finally {
+                    isProcessing = false;
+                    setButtonMode(false);
+                }
             }
         }
     } catch (e) {

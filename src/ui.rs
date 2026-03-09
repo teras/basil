@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Panayotis Katsaloulis
+
 //! Embedded web UI serving.
 
 use axum::{

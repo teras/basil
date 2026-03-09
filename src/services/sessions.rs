@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Panayotis Katsaloulis
+
 //! Session management with persistence.
 
 use crate::config::get_settings;
@@ -270,6 +273,15 @@ impl SessionManager {
             }
         }
         self.update_session(session_id).await
+    }
+
+    /// Get all sessions currently processing (session_id, plan_mode)
+    pub async fn get_processing_sessions(&self) -> Vec<(String, bool)> {
+        self.sessions.read().await
+            .iter()
+            .filter(|(_, r)| r.is_processing)
+            .map(|(id, r)| (id.clone(), r.data.plan_mode))
+            .collect()
     }
 
     /// Delete session

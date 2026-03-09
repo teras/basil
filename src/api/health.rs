@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Panayotis Katsaloulis
+
 //! Health check, project info, and initialization status endpoints.
 
 use axum::{extract::State, routing::get, Json, Router};
