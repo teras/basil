@@ -249,15 +249,21 @@ This project is running inside Basil, an isolated Docker container for secure Cl
 
 You do not have access to the user's home directory, system configs, or paths outside /workspace unless explicitly mounted.
 
-## MCP Tools Available
+## Installing Packages — MUST use install_package
 
-- `request_mount` - Request access to a host directory (auto-restarts on approval)
-- `install_package` - Add Dockerfile commands for persistent packages (auto-restarts on approval)
-- `list_mounts` - Show configured mounts
+Direct installs (`apt install`, `pip install`, etc.) are NOT persistent and will be lost on container restart.
+**Always use the `install_package` MCP tool** — it writes Dockerfile commands that persist across restarts.
 
-## Path Convention
+## Accessing Host Paths — MUST use request_mount
 
-When the user mentions paths like `~/data` or `/home/user/files`, these are **host paths** on their machine. Use `request_mount` to access them.
+Paths the user mentions (e.g. `~/data`) are on their machine, not in your container.
+**Always use the `request_mount` MCP tool** to request access. After approval the container restarts and the path becomes available.
+
+## MCP Tools
+
+- `request_mount` — Request host directory access (auto-restarts on approval)
+- `install_package` — Persistent package installation via Dockerfile (auto-restarts on approval)
+- `list_mounts` — Show configured mounts
 "#;
 
     std::fs::write(&claude_md_path, content)?;
